@@ -105,15 +105,32 @@ Each input can be further configured by input type and action. In the CLI you pu
 
 **Number of contexts** (CLI `-S|--selectors xCOUNT`) relates to the complexity of modelling. The larger number of contexts will compress better, but at the expense of linear increase in both the time and memory usage. The default is 12, which targets at most 1 second of latency permitted for typical 30 KB input.
 
-**Maximum memory usage** (CLI `-M|--max-memory MEGABYTES`, API `maxMemoryMB` in the options object) configures the primary context-table budget in decimal megabytes (1 MB = 1,000,000 bytes), including the extra word model when SSE is enabled. Auxiliary mixer weights are additional. Increasing or decreasing memory usage mostly affects the compression ratio and not the run time. The default is 150 MB and a larger value is not recommended for various reasons:
+**Maximum memory usage** (CLI `-M|--max-memory MEGABYTES`, API `maxMemoryMB` in the options object) controls the memory budget for model context tables, including the extra word model when SSE is enabled. Auxiliary mixer weights are additional. Higher values may improve compression at the cost of substantially higher decompression memory usage and allocation time.
 
-* Any further gain for larger memory use is negligible for typical inputs less than 100 KB.
+Memory values use decimal megabytes: 1 MB = 1,000,000 bytes. The requested memory value is a budget rather than an exact allocation. Context tables use power-of-two capacities, so multiple memory budgets may select the same table size. Use `-v` to print the actual context-table memory usage to stderr.
 
-* The compression may use more memory than the decompression: an one-shot compression may use up to 50% more memory, the optimizer will use 50% more on top of that.
+Useful starting points:
 
-* It does take time to allocate and initialize a larger memory (~500 ms for 1 GB), so it is not a good choice for small inputs.
+- **150 MB:** conservative/default.
+- **500 MB:** more compression-focused where memory use is less constrained.
+- **1000 MB:** size-focused; a good balance for memory-tolerant sizecoding.
+- **2000 MB:** aggressive size-first setting.
 
-The actual memory usage can be as low as a half of the specified due to the internal architecture; `-v` will print the actual memory usage to stderr.
+```sh
+# Conservative
+roadroller -M150 input.js -o packed.js
+
+# More compression-focused
+roadroller -M500 input.js -o packed.js
+
+# Size-focused
+roadroller -M1000 input.js -o packed.js
+
+# Aggressive
+roadroller -M2000 input.js -o packed.js
+```
+
+The CLI accepts budgets from 10 to 4000 MB. Larger tables do not guarantee smaller output, so compare the final compressed archive when choosing a value.
 
 **Allowing the decoder to pollute the global scope** (CLI `-D|--dirty`, API `allowFreeVars` in the options object) is unsafe especially when the Roadroller output should coexist with other code or there are elements with single letter `id` attributes and turned off by default. But if you can control your environment (typical for demos), you can turn this on for a smaller decoder.
 

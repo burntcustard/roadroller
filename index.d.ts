@@ -196,7 +196,17 @@ export interface PackerOptions {
     sse?: boolean;
     pairRecipLearningRate?: number;
     sparseSelectors?: number[];
-    /** Primary context-table budget in decimal MB (1 MB = 1,000,000 bytes). */
+    /**
+     * Memory budget for model context tables, in decimal MB
+     * (1 MB = 1,000,000 bytes).
+     *
+     * Higher values may improve compression at the cost of greater
+     * decompression memory usage. Context table sizes increase in
+     * power-of-two steps, so the actual allocation may be below this value.
+     * Auxiliary mixer weights are additional.
+     *
+     * Default: 150.
+     */
     maxMemoryMB?: number;
     contextBits?: number;
     precision?: number;

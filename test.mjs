@@ -633,3 +633,17 @@ test('CLI validates wrappers and keeps them out of output', t => {
     t.false(code.includes('</script>'));
     t.is(Function(`return ${code}`)(), 7);
 });
+
+
+test('CLI validates decimal memory budgets up to 4000 MB', t => {
+    // Help still validates options, without allocating context tables.
+    for (const flag of ['-M', '--max-memory=']) {
+        for (const budget of [150, 500, 1000, 2000, 4000, 4001]) {
+            const result = spawnSync(process.execPath, ['cli.mjs', `${flag}${budget}`, '--help'], {
+                encoding: 'utf8',
+            });
+            t.is(result.status, budget <= 4000 ? 0 : 1, result.stderr);
+            if (budget > 4000) t.true(result.stderr.includes('invalid --max-memory argument'));
+        }
+    }
+});
