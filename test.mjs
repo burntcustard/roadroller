@@ -625,7 +625,7 @@ test('CLI validates wrappers and keeps them out of output', t => {
     t.true(result.stderr.includes('cannot read optimize wrapper'));
     // --sse must leave the default optimization enabled. Verbose progress also
     // reports the flag among the parameters needed to reproduce the decoder.
-    result = run(['--zopfli', '--optimize-wrapper', wrapper, '--sse', '-M10', '-o', output]);
+    result = run(['--zopfli', '--optimize-wrapper', wrapper, '--sse', '-M100', '-o', output]);
     t.is(result.status, 0, result.stderr);
     t.true(result.stderr.includes('--sse'));
     const code = fs.readFileSync(output, 'utf8');
@@ -638,12 +638,12 @@ test('CLI validates wrappers and keeps them out of output', t => {
 test('CLI validates decimal memory budgets up to 4000 MB', t => {
     // Help still validates options, without allocating context tables.
     for (const flag of ['-M', '--max-memory=']) {
-        for (const budget of [150, 500, 1000, 2000, 4000, 4001]) {
+        for (const budget of [99, 100, 150, 500, 1000, 2000, 4000, 4001]) {
             const result = spawnSync(process.execPath, ['cli.mjs', `${flag}${budget}`, '--help'], {
                 encoding: 'utf8',
             });
-            t.is(result.status, budget <= 4000 ? 0 : 1, result.stderr);
-            if (budget > 4000) t.true(result.stderr.includes('invalid --max-memory argument'));
+            t.is(result.status, budget >= 100 && budget <= 4000 ? 0 : 1, result.stderr);
+            if (budget < 100 || budget > 4000) t.true(result.stderr.includes('invalid --max-memory argument'));
         }
     }
 });

@@ -205,7 +205,7 @@ export interface PackerOptions {
      * power-of-two steps, so the actual allocation may be below this value.
      * Auxiliary mixer weights are additional.
      *
-     * Default: 150.
+     * Default: 500.
      */
     maxMemoryMB?: number;
     contextBits?: number;

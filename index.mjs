@@ -898,7 +898,7 @@ export class Packer {
         }
         this.options = {
             sparseSelectors: options.sparseSelectors ? options.sparseSelectors.slice() : defaultSparseSelectors(),
-            maxMemoryMB: options.maxMemoryMB || 150,
+            maxMemoryMB: options.maxMemoryMB || 500,
             precision: options.precision || 16,
             modelMaxCount: options.modelMaxCount || 5,
             modelRecipBaseCount: options.modelRecipBaseCount || 20,

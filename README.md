@@ -111,8 +111,8 @@ Memory values use decimal megabytes: 1 MB = 1,000,000 bytes. The requested memor
 
 Useful starting points:
 
-- **150 MB:** conservative/default.
-- **500 MB:** more compression-focused where memory use is less constrained.
+- **150 MB:** conservative.
+- **500 MB:** default; more compression-focused where memory use is less constrained.
 - **1000 MB:** size-focused; a good balance for memory-tolerant sizecoding.
 - **2000 MB:** aggressive size-first setting.
 
@@ -120,7 +120,7 @@ Useful starting points:
 # Conservative
 roadroller -M150 input.js -o packed.js
 
-# More compression-focused
+# Default (more compression-focused)
 roadroller -M500 input.js -o packed.js
 
 # Size-focused
@@ -130,7 +130,7 @@ roadroller -M1000 input.js -o packed.js
 roadroller -M2000 input.js -o packed.js
 ```
 
-The CLI accepts budgets from 10 to 4000 MB. Larger tables do not guarantee smaller output, so compare the final compressed archive when choosing a value.
+The CLI accepts budgets from 100 to 4000 MB. Larger tables do not guarantee smaller output, so compare the final compressed archive when choosing a value.
 
 **Allowing the decoder to pollute the global scope** (CLI `-D|--dirty`, API `allowFreeVars` in the options object) is unsafe especially when the Roadroller output should coexist with other code or there are elements with single letter `id` attributes and turned off by default. But if you can control your environment (typical for demos), you can turn this on for a smaller decoder.
 

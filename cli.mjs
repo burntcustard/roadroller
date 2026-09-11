@@ -70,7 +70,7 @@ Output options:
   Scores candidates within FILE, which must contain exactly one
   __ROADROLLER__ marker. Currently requires --zopfli.
   The wrapper affects scoring only; output remains packed JavaScript.
--M|--max-memory MEGABYTES [Range: 10..4000, Default: 150]
+-M|--max-memory MEGABYTES [Range: 100..4000, Default: 500]
   Configures primary context-table memory in decimal MB (1 MB = 1,000,000 bytes).
   Includes the SSE word model; auxiliary mixer weights are additional.
   Larger budgets may improve compression but increase decoder memory
@@ -321,7 +321,7 @@ async function parseArgs(args) {
     }
     if (options.maxMemoryMB !== undefined) {
         if (options.contextBits !== undefined) throw '--max-memory and --context-bits cannot be used together';
-        if (!between(10, options.maxMemoryMB, 4000)) throw 'invalid --max-memory argument';
+        if (!between(100, options.maxMemoryMB, 4000)) throw 'invalid --max-memory argument';
     } else if (options.contextBits !== undefined) {
         if (!between(1, options.contextBits, 30)) throw 'invalid --context-bits argument';
         const numSelectors = options.sparseSelectors ? options.sparseSelectors.length : 12;
@@ -398,7 +398,7 @@ async function compress({ inputs, options, optimize, useZopfli, outputPath, verb
     if (verbose >= 1) {
         console.warn(
             `Actual memory usage: ${packer.memoryUsageMB < 1 ? '< 1' : packer.memoryUsageMB.toFixed(1)} MB` +
-            (options.contextBits ? '' : ` (out of ${options.maxMemoryMB || 150} MB)`));
+            (options.contextBits ? '' : ` (out of ${options.maxMemoryMB || 500} MB)`));
     }
 
     if (optimize) {
