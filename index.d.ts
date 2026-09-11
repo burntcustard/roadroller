@@ -86,6 +86,9 @@ export class LogisticMixModel implements Model {
 }
 
 export interface DefaultModelOptions extends DirectContextModelOptions, LogisticMixModelOptions {
+    /** Opt-in compact secondary symbol estimation. Default: false. */
+    sse?: boolean;
+    pairRecipLearningRate?: number;
     sparseSelectors: number[];
     modelQuotes: boolean;
 }
@@ -182,6 +185,9 @@ export const enum DynamicModelFlags {
 }
 
 export interface PackerOptions {
+    /** Opt-in compact SSE. May improve the final ZIP; not a universal win. */
+    sse?: boolean;
+    pairRecipLearningRate?: number;
     sparseSelectors?: number[];
     maxMemoryMB?: number;
     contextBits?: number;
@@ -209,6 +215,7 @@ export interface PackerOptions {
 }
 
 export interface OptimizedPackerOptions {
+    pairRecipLearningRate?: number;
     sparseSelectors: number[];
     precision?: number;
     modelMaxCount?: number;

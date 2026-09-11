@@ -5,7 +5,6 @@ import process from 'process';
 import * as readline from 'readline';
 import { performance } from 'perf_hooks';
 import { ResourcePool, Packer, defaultSparseSelectors } from './index.mjs';
-import { createZopfliPackedScore } from './zopfli.mjs';
 
 let VERSION = 'unknown';
 try {
@@ -57,6 +56,10 @@ Output options:
   Anything beyond -O0 prints the best parameters unless -q is given.
   Pressing Ctrl-C (SIGINT) anytime aborts the search and proceeds
   with the best parameters so far.
+--sse [Default: false]
+  Enables compact two-context secondary symbol estimation.
+  Increases decoder size and auxiliary memory; measure the final archive.
+  This switch is fixed during parameter search, not automatically enabled.
 --zopfli
   Uses actual Zopfli DEFLATE size for optimization.
   Candidates within 8 bytes at 1 iteration are compared at 100 iterations.
@@ -221,8 +224,12 @@ async function parseArgs(args) {
             if (optimize !== undefined) throw 'duplicate --optimize arguments';
             const arg = getArg(m);
             optimize = arg === 'O' ? Infinity : parseInt(arg, 10);
+        } else if (matchOpt('sse')) {
+            if (options.sse !== undefined) throw 'duplicate --sse arguments';
+            options.sse = true;
         } else if (matchOpt('zopfli')) {
             if (useZopfli) {
+        const { createZopfliPackedScore } = await import('./zopfli.mjs');
                 throw 'duplicate --zopfli arguments';
             }
             useZopfli = true;
@@ -418,6 +425,9 @@ async function compress({ inputs, options, optimize, useZopfli, outputPath, verb
             }
             if (typeof combined.precision === 'number') {
                 args = `-Zpr${combined.precision} ${args}`;
+            }
+            if (combined.sse) {
+                args = `--sse ${args}`;
             }
             if (combined.useUint16Counts) {
                 args = `-Zuc ${args}`;

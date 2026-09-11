@@ -143,6 +143,8 @@ The actual memory usage can be as low as a half of the specified due to the inte
 
 The optimizer also searches the ordinary and pair learning rates together, keeping `recipLearningRate / pairRecipLearningRate` at integer factors 1 through 6 (plus the current integer factor, if within the search bounds). These ratios produce short multipliers in the generated decoder. Level 1 samples a few scales for each factor; higher levels refine each scale locally. Independent rate searches then allow non-integer ratios to win when they produce a better score. The existing rate options retain their meanings.
 
+**Secondary symbol estimation** (CLI `--sse`, API `sse: true`, default `false`) adds a compact correction to the mixed prediction in logit space. It uses eight wrapping buckets with no interpolation, trained by the current byte prefix and previous byte. SSE shares a padded mixer weights array and increases decoder size and auxiliary memory; measure the final archive to decide whether it helps. The context-table memory estimate does not include these auxiliary mixer weights. SSE uses the JavaScript encoder rather than the existing WASM runner and stays fixed during parameter search. Reported CLI parameters retain `--sse` so they reproduce the selected mode.
+
 **16-bit count tables** (CLI `-Zuc|--uint16-counts`, API `useUint16Counts`, default `false`) use `Uint16Array` where the generated decoder would normally use `Uint8Array`. This can reduce compressed decoder size, at the cost of more table memory and initialization work. Memory budgeting accounts for the wider table. Larger count tables are unchanged, and this flag does not disable default optimization.
 
 **Optimization wrappers** (CLI `--optimize-wrapper FILE`, API `optimizePrefix` and `optimizeSuffix`) supply the surrounding content when scoring a candidate. The wrapper file must contain exactly one `__ROADROLLER__` marker, for example `<script>__ROADROLLER__</script>`. The CLI currently requires `--zopfli` for this option:
@@ -150,6 +152,8 @@ The optimizer also searches the ordinary and pair learning rates together, keepi
 ```sh
 roadroller --zopfli --optimize-wrapper page-wrapper.html -Zuc -O1 input.js -o packed.js
 ```
+
+The optional `node-zopfli-es` dependency is loaded by the CLI only when `--zopfli` is requested.
 
 The wrapper affects scoring only: `packed.js` and `makeDecoder()` still contain only Roadroller output. The legacy size estimator remains unchanged and does not score wrapper content.
 

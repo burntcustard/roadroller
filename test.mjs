@@ -407,14 +407,18 @@ function packAndReturn(data, options = {}) {
 }
 
 test('Packer', t => {
-    t.is(packAndEval('3 + 4 * 5'), 23);
-    t.is(packAndReturn('3 + 4 * 5'), '3+4*5');
+    for (const sse of [false, true]) {
+        t.is(packAndEval('3 + 4 * 5', { sse }), 23);
+        t.is(packAndReturn('3 + 4 * 5', { sse }), '3+4*5');
 
-    // allowFreeVars
-    const cleanlyPacked = pack('3 + 4 * 5', { allowFreeVars: true });
-    t.deepEqual(cleanlyPacked.freeVars, []);
-    t.is(packAndEval('3 + 4 * 5', { allowFreeVars: true }), 23);
-    t.is(packAndReturn('3 + 4 * 5', { allowFreeVars: true }), '3+4*5');
+        // Dirty decoders report the variables the caller needs to declare.
+        const packed = pack('3 + 4 * 5', { sse, allowFreeVars: true });
+        t.true(packed.freeVars.length > 0);
+        if (sse) t.true(packed.freeVars.includes('l'));
+        t.is(packAndEval('3 + 4 * 5', { sse, allowFreeVars: true }), 23);
+        t.is(packAndReturn('3 + 4 * 5', { sse, allowFreeVars: true }), '3+4*5');
+    }
+    t.throws(() => pack('1', { sse: 1 }), { message: 'Packer: sse must be a boolean' });
 });
 
 for (const [level, targetRate, targetPairRate] of [[1, 1876, 469], [2, 1600, 400]]) {
@@ -592,6 +596,9 @@ test('optimizer supplies exact wrapped input and invalidates incompatible scores
     packer.options.optimizeScore = (...args) => score(...args);
     await initialOnly();
     t.is(calls, 4);
+    packer.options.sse = true;
+    await initialOnly();
+    t.is(calls, 5);
 });
 
 test('Zopfli scores supplied UTF-8 input with byte-length tie breaking', t => {

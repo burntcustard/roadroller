@@ -444,6 +444,34 @@ export class LogisticMixModel {
     }
 }
 
+// Compact, opt-in secondary symbol estimation, shared by encoder and decoder.
+const SSE_BINS = 8;
+const SSE_PREFIX_STRIDE = 6;
+const SSE_LOGIT_DIVISOR = 3;
+const SSE_RECIP_LEARNING_RATE = 32;
+const SSE_BYTE_LEARNING_FACTOR = 2;
+
+const contextualMixerLayout = (numModels, alphabetSize, sse) => {
+    const byteOffset = numModels;
+    let pairOffset = numModels * (1 + alphabetSize);
+    let prefixOffset = pairOffset + numModels * alphabetSize * alphabetSize;
+    let weightCount = prefixOffset + numModels * alphabetSize;
+    let sseOffset = 0;
+    let sseRowStride = 0;
+    if (sse) {
+        const nextPowerOfTwo = n => 2 ** Math.ceil(Math.log2(Math.max(1, n)));
+        pairOffset = nextPowerOfTwo(pairOffset);
+        prefixOffset = nextPowerOfTwo(pairOffset + numModels * alphabetSize * alphabetSize);
+        const prefixEnd = prefixOffset + numModels * alphabetSize;
+        sseOffset = Math.ceil(prefixEnd / 65536) * 65536;
+        sseRowStride = alphabetSize * SSE_BINS;
+        const required = sseOffset + alphabetSize * sseRowStride +
+            (alphabetSize - 1) * SSE_PREFIX_STRIDE + SSE_BINS;
+        weightCount = Math.max(600000, Math.ceil(required / 100000) * 100000);
+    }
+    return { byteOffset, pairOffset, prefixOffset, weightCount, sseOffset, sseRowStride };
+};
+
 export class ContextualLogisticMixModel extends LogisticMixModel {
     constructor(models, options) {
         super(models, options);
@@ -461,40 +489,17 @@ export class ContextualLogisticMixModel extends LogisticMixModel {
         this.numModels = numModels;
         this.alphabetSize = alphabetSize;
 
-        // Layout of this.weights:
-        //
-        // global:
-        //   1 * numModels
-        //
-        // previous byte:
-        //   alphabetSize * numModels
-        //
-        // previous two bytes:
-        //   alphabetSize² * numModels
-        //
-        // current partial-byte prefix:
-        //   alphabetSize * numModels
-
-        this.byteWeightOffset = numModels;
-
-        this.pairWeightOffset =
-            numModels * (1 + alphabetSize);
-
-        this.prefixWeightOffset =
-            numModels * (
-                1 +
-                alphabetSize +
-                alphabetSize * alphabetSize
-            );
-
-        const weightCount =
-            numModels * (
-                1 +
-                2 * alphabetSize +
-                alphabetSize * alphabetSize
-            );
-
-        this.weights = new Float64Array(weightCount);
+        // Global, byte, pair and prefix mixer weights, then optional SSE rows.
+        this.sse = !!options.sse;
+        const layout = contextualMixerLayout(numModels, alphabetSize, this.sse);
+        this.byteWeightOffset = layout.byteOffset;
+        this.pairWeightOffset = layout.pairOffset;
+        this.prefixWeightOffset = layout.prefixOffset;
+        this.sseWeightOffset = layout.sseOffset;
+        this.sseRowStride = layout.sseRowStride;
+        this.weights = new Float64Array(layout.weightCount);
+        this.sseIndex = 0;
+        this.sseByteIndex = 0;
 
         this.previousByte = 0;
         this.previousByte2 = 0;
@@ -547,9 +552,15 @@ export class ContextualLogisticMixModel extends LogisticMixModel {
             total += weight * stretchedProb;
         }
 
-        const mixedProb =
-            ((2 << this.precision) - 1) /
-            (1 + Math.exp(-total));
+        let logit = -total;
+        if (this.sse) {
+            // Intentionally wrap eight hard buckets; no clamping or interpolation.
+            this.sseIndex = this.sseWeightOffset + SSE_PREFIX_STRIDE * this.bitContext +
+                ((logit / SSE_LOGIT_DIVISOR + SSE_BINS / 2) & (SSE_BINS - 1));
+            this.sseByteIndex = this.sseIndex + (this.previousByte + 1) * this.sseRowStride;
+            logit -= this.weights[this.sseIndex] + this.weights[this.sseByteIndex];
+        }
+        const mixedProb = ((2 << this.precision) - 1) / (1 + Math.exp(logit));
 
         this.mixedProb = mixedProb | 1;
 
@@ -573,7 +584,9 @@ export class ContextualLogisticMixModel extends LogisticMixModel {
                 this.recipLearningRate *
                 error;
 
-            const pairDelta =
+            // SSE must reproduce the generated decoder's floating-point order.
+            const pairDelta = this.sse ?
+                commonDelta * (this.recipLearningRate / this.pairRecipLearningRate) :
                 stretchedProb /
                 this.pairRecipLearningRate *
                 error;
@@ -593,6 +606,11 @@ export class ContextualLogisticMixModel extends LogisticMixModel {
             ] += commonDelta;
         }
 
+        if (this.sse) {
+            const delta = error / SSE_RECIP_LEARNING_RATE;
+            this.weights[this.sseIndex] += delta;
+            this.weights[this.sseByteIndex] += delta * SSE_BYTE_LEARNING_FACTOR;
+        }
         this.bitContext =
             (this.bitContext << 1) | actualBit;
     }
@@ -716,6 +734,7 @@ export const compressWithDefaultModel = (input, options) => {
         resourcePool &&
         (options.preset || []).length === 0 &&
         !options.disableWasm &&
+        !options.sse &&
         !options.calculateByteEntropy &&
         options.sparseSelectors.length <= 64 &&
         options.sparseSelectors.every(sel => sel < 0x8000)
@@ -847,6 +866,9 @@ const DYN_MODEL_QUOTES = 1;
 
 export class Packer {
     constructor(inputs, options = {}) {
+        if (options.sse !== undefined && typeof options.sse !== 'boolean') {
+            throw new Error('Packer: sse must be a boolean');
+        }
         this.options = {
             sparseSelectors: options.sparseSelectors ? options.sparseSelectors.slice() : defaultSparseSelectors(),
             maxMemoryMB: options.maxMemoryMB || 150,
@@ -862,6 +884,7 @@ export class Packer {
             allowFreeVars: options.allowFreeVars,
             disableWasm: options.disableWasm,
             useUint16Counts: !!options.useUint16Counts,
+            sse: !!options.sse,
             optimizePrefix: options.optimizePrefix || '',
             optimizeSuffix: options.optimizeSuffix || '',
             optimizeScore: options.optimizeScore,
@@ -1154,24 +1177,27 @@ export class Packer {
 
         const mixerAlphabetSize = 1 << inBits;
 
-        const mixerByteOffset = numModels;
-
-        const mixerPairOffset = numModels * (
-            1 +
-            mixerAlphabetSize
-        );
-
-        const mixerPrefixOffset = numModels * (
-            1 +
-            mixerAlphabetSize +
-            mixerAlphabetSize * mixerAlphabetSize
-        );
-
-        const mixerWeightCount = numModels * (
-            1 +
-            2 * mixerAlphabetSize +
-            mixerAlphabetSize * mixerAlphabetSize
-        );
+        const mixerLayout = contextualMixerLayout(numModels, mixerAlphabetSize, options.sse);
+        const mixerByteOffset = mixerLayout.byteOffset;
+        const mixerPairOffset = mixerLayout.pairOffset;
+        const compactOffset = offset => {
+            const factor = offset / (2 << precision);
+            return options.sse && Number.isInteger(factor) && factor >= 1 && factor <= 9
+                ? (factor === 1 ? 'θ' : `${factor}*θ`) : `${offset}`;
+        };
+        const mixerPrefixOffset = compactOffset(mixerLayout.prefixOffset);
+        const mixerWeightCount = options.sse
+            ? String(mixerLayout.weightCount).replace(/0{3,}$/, zeros => `e${zeros.length}`)
+            : mixerLayout.weightCount;
+        const ssePredict = options.sse ?
+            `δ=${compactOffset(mixerLayout.sseOffset)}+${SSE_PREFIX_STRIDE}*ν+` +
+                `(Σ/${SSE_LOGIT_DIVISOR}+${SSE_BINS / 2}&${SSE_BINS - 1}),` +
+            `l=δ+((ο[λ-1]||0)+1<<${inBits + 3}),` +
+            `Σ-=ω[δ]+ω[l],` : '';
+        const sseUpdate = options.sse ?
+            `α=(β-Σ/θ)/${SSE_RECIP_LEARNING_RATE},` +
+            `ω[δ]+=α,` +
+            `ω[l]+=α*${SSE_BYTE_LEARNING_FACTOR},` : '';
 
         const pairLearningFactor =
             recipLearningRate /
@@ -1390,6 +1416,7 @@ export class Packer {
                 // depends both on step 5 (renormalization) and on step 6 (mixed prediction).
                 //
                 // Σ: squash(sum of weighted preds) followed by adjustment
+                ssePredict +
                 `Σ=~-θ/(1+Math.exp(Σ))|1,` +
                 // β: decoded bit
                 `β=τ%θ<Σ,` +
@@ -1416,6 +1443,7 @@ export class Packer {
                     `ω[${pairWeightIndex}]+=α*${pairLearningFactor},` +
                     `ω[${prefixWeightIndex}]+=α` +
                 `)),` +
+                sseUpdate +
                 `ν=ν*2+β` +
 
             `)` +
@@ -1508,7 +1536,8 @@ export class Packer {
             'charCodeAt' +
             'Uiny' + // from `Uint##Array`, the best possible without any further duplicate
             'xp' + // from `exp`
-            (quotes.length > 0 ? 'f' : ''); // from `for`
+            (quotes.length > 0 ? 'f' : '') + // from `for`
+            (options.sse ? 'l' : ''); // second SSE index
 
         if (options.allowFreeVars) {
             firstLine += ';';
@@ -1536,10 +1565,14 @@ export class Packer {
         firstLine = firstLine.replace(/[^\0-\x7f]/g, v => idMap.get(v));
         secondLine = secondLine.replace(/[^\0-\x7f]/g, v => idMap.get(v));
 
-        const boundVars = ['δ', 'μ']; // always local to .map()
-        const freeVars = options.allowFreeVars ?
-            Object.keys(idMap).filter(v => !boundVars.includes(v)).map(v => idMap[v]).sort() :
-            [];
+        const boundVars = options.sse ? ['μ'] : ['δ', 'μ'];
+        const freeVars = options.allowFreeVars ? [...new Set([
+            ...[...idMap]
+                .filter(([v, name]) => name && !boundVars.includes(v) &&
+                    (v !== 'χ' || quotes.length > 0))
+                .map(([, name]) => name),
+            ...(options.sse ? ['l'] : []),
+        ])].sort() : [];
 
         return {
             firstLine,
@@ -1628,6 +1661,7 @@ export class Packer {
                 options.contextBits,
                 options.maxMemoryMB,
                 options.useUint16Counts,
+                options.sse,
                 options.optimizePrefix,
                 options.optimizeSuffix,
                 options.allowFreeVars,
