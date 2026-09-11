@@ -854,13 +854,14 @@ export class Packer {
             modelMaxCount: options.modelMaxCount || 5,
             modelRecipBaseCount: options.modelRecipBaseCount || 20,
             recipLearningRate: options.recipLearningRate || Math.max(1, 500),
-            pairRecipLearningRate: options.pairRecipLearningRate || 400,
+            pairRecipLearningRate: options.pairRecipLearningRate || 500,
             contextBits: options.contextBits,
             resourcePool: options.resourcePool || options.arrayBufferPool || new ResourcePool(),
             numAbbreviations: typeof options.numAbbreviations === 'number' ? options.numAbbreviations : 64,
             dynamicModels: options.dynamicModels,
             allowFreeVars: options.allowFreeVars,
             disableWasm: options.disableWasm,
+            optimizeScore: options.optimizeScore,
         };
 
         this.inputsByType = {};
@@ -1567,6 +1568,24 @@ export class Packer {
         const performance = await getPerformanceObject();
         const copy = v => JSON.parse(JSON.stringify(v));
 
+        const compareSizes = (a, b) => {
+            if (
+                a &&
+                typeof a.compare === 'function'
+            ) {
+                return a.compare(b);
+            }
+
+            if (
+                b &&
+                typeof b.compare === 'function'
+            ) {
+                return -b.compare(a);
+            }
+
+            return Number(a) - Number(b);
+        };
+
         const cache = new Map(); // `${dynamicModels},${numAbbreviations}` -> { preparedText, preparedJs }
         const mainInputAction = (this.inputsByType['text'] || this.inputsByType['js'])[0].action;
 
@@ -1584,7 +1603,12 @@ export class Packer {
             const { preparedText, preparedJs } = cache.get(key);
             const result = Packer.doPack(preparedText, preparedJs, mainInputAction, options);
             if (maxAbbreviations < 0) maxAbbreviations = result.maxAbbreviations;
-            return new Packed(result).estimateLength();
+
+            const packed = new Packed(result);
+
+            return options.optimizeScore
+                ? options.optimizeScore(packed, options)
+                : packed.estimateLength();
         };
 
         const reportProgress = async (pass, passRatio, current, currentSize, currentRejected, bestUpdated) => {
@@ -1592,8 +1616,8 @@ export class Packer {
 
             const info = {
                 pass, passRatio,
-                current, currentSize, currentRejected,
-                best, bestSize, bestUpdated,
+                current, currentSize: Number(currentSize), currentRejected,
+                best, bestSize: Number(bestSize), bestUpdated,
             };
             if (await progress(info) === false) throw new Error('search aborted');
         };
@@ -1607,7 +1631,7 @@ export class Packer {
         const updateBest = current => {
             const size = calculateSize(current);
             let bestUpdated = false;
-            if (size < bestSize) {
+            if (compareSizes(size, bestSize) < 0) {
                 best = copy(current);
                 bestSize = size;
                 bestUpdated = true;
@@ -1669,7 +1693,9 @@ export class Packer {
 
                 let min = 0;
                 for (let i = 1; i < 5; ++i) {
-                    if (yy[min] > yy[i]) min = i;
+                    if (compareSizes(yy[min], yy[i]) > 0) {
+                        min = i;
+                    }
                 }
                 if (min === 0) {
                     hi = xx[1];
@@ -1753,9 +1779,19 @@ export class Packer {
         });
         if (best.recipLearningRate === this.options.recipLearningRate) delete best.recipLearningRate;
 
+        // optimize pairRecipLearningRate
+        await search(1, 99999, EXP, [250, 400, 500, 750, 1000], async (i, ratio) => {
+            return await updateBestAndReportProgress({ ...best, pairRecipLearningRate: i }, 'pairRecipLearningRate', ratio);
+        });
+        if (best.pairRecipLearningRate === this.options.pairRecipLearningRate) delete best.pairRecipLearningRate;
+
         // apply the final result to this
         this.options = { ...this.options, ...best };
-        return { elapsedMsecs: performance.now() - searchStart, best, bestSize };
+        return {
+            elapsedMsecs: performance.now() - searchStart,
+            best,
+            bestSize: Number(bestSize),
+        };
     }
 }
 
@@ -1782,4 +1818,3 @@ class Packed {
             estimateDeflatedSize(this.secondLine));
     }
 }
-

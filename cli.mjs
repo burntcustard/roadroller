@@ -5,6 +5,7 @@ import process from 'process';
 import * as readline from 'readline';
 import { performance } from 'perf_hooks';
 import { ResourcePool, Packer, defaultSparseSelectors } from './index.mjs';
+import { createZopfliPackedScore } from './zopfli.mjs';
 
 let VERSION = 'unknown';
 try {
@@ -56,6 +57,10 @@ Output options:
   Anything beyond -O0 prints the best parameters unless -q is given.
   Pressing Ctrl-C (SIGINT) anytime aborts the search and proceeds
   with the best parameters so far.
+--zopfli
+  Uses actual Zopfli DEFLATE size for optimization.
+  Equal-size candidates are progressively compared at
+  1, 2, 4, 8, 16, 32, 64 and 128 iterations.
 -M|--max-memory MEGABYTES [Range: 10..1024, Default: 150]
   Configures the maximum memory usage.
   The actual usage might be lower. Use -v to print the actual usage.
@@ -88,6 +93,8 @@ Output options:
              can't be used in English texts with contractions (e.g. isn't).
 -Zlr|--learning-rate RATE [Range: 1..2^53, Default: 500]
   Configures the learning rate of context mixer; smaller adapts faster.
+-Zlp|--pair-learning-rate RATE [Range: 1..2^53, Default: 400]
+  Configures the learning rate of the previous-byte-pair mixer; smaller adapts faster.
 -Zmc|--model-max-count COUNT [Range: 1..32767, Default: 5]
   Configures the adaptation speed of context models.
   Context models adapt fastest when the context is first seen,
@@ -132,6 +139,7 @@ async function parseArgs(args) {
     };
     let command;
     let optimize;
+    let useZopfli = false;
     let defaultOptimize = 1;
     let outputPath;
     let nextIsArg = false;
@@ -203,6 +211,11 @@ async function parseArgs(args) {
             if (optimize !== undefined) throw 'duplicate --optimize arguments';
             const arg = getArg(m);
             optimize = arg === 'O' ? Infinity : parseInt(arg, 10);
+        } else if (matchOpt('zopfli')) {
+            if (useZopfli) {
+                throw 'duplicate --zopfli arguments';
+            }
+            useZopfli = true;
         } else if (m = matchOptArg('max-memory', 'M')) {
             if (options.maxMemoryMB !== undefined) throw 'duplicate --max-memory arguments';
             options.maxMemoryMB = parseInt(getArg(m), 10);
@@ -234,6 +247,10 @@ async function parseArgs(args) {
         } else if (m = matchOptArg('dynamic-models', 'Zdy')) {
             if (options.dynamicModels !== undefined) throw 'duplicate --dynamic-models arguments';
             options.dynamicModels = parseInt(getArg(m), 10);
+        } else if (m = matchOptArg('pair-learning-rate', 'Zlp')) {
+            if (options.pairRecipLearningRate !== undefined) throw 'duplicate --pair-learning-rate arguments';
+            options.pairRecipLearningRate = parseInt(getArg(m), 10);
+            defaultOptimize = 0;
         } else if (m = matchOptArg('learning-rate', 'Zlr')) {
             if (options.recipLearningRate !== undefined) throw 'duplicate --learning-rate arguments';
             options.recipLearningRate = parseInt(getArg(m), 10);
@@ -300,6 +317,12 @@ async function parseArgs(args) {
     if (options.recipLearningRate !== undefined && !between(1, options.recipLearningRate, 2**53)) {
         throw 'invalid --learning-rate argument';
     }
+    if (
+        options.pairRecipLearningRate !== undefined &&
+        !between(1, options.pairRecipLearningRate, 2**53)
+    ) {
+        throw 'invalid --pair-learning-rate argument';
+    }
     if (options.modelMaxCount !== undefined && !between(1, options.modelMaxCount, 32767)) {
         throw 'invalid --model-max-count argument';
     }
@@ -317,10 +340,22 @@ async function parseArgs(args) {
         return { command, verbose };
     }
 
-    return { command: 'compress', inputs, options, optimize, outputPath, verbose };
+    return {
+        command: 'compress',
+        inputs,
+        options,
+        optimize,
+        useZopfli,
+        outputPath,
+        verbose,
+    };
 }
 
-async function compress({ inputs, options, optimize, outputPath, verbose }) {
+async function compress({ inputs, options, optimize, useZopfli, outputPath, verbose }) {
+    if (useZopfli) {
+        options.optimizeScore =
+            createZopfliPackedScore();
+    }
     let packer = new Packer(inputs, options);
     const origLength = inputs.reduce((acc, { data } ) => {
         return acc + (Array.isArray(data) ? data.length : unescape(encodeURIComponent(data)).length);
@@ -341,7 +376,7 @@ async function compress({ inputs, options, optimize, outputPath, verbose }) {
                 ''; // more than 13 selectors are randomly determined
 
         const format = moreOptions => {
-            const combined = { ...options, ...moreOptions };
+            const combined = { ...packer.options, ...moreOptions };
             let args;
             if (!combined.sparseSelectors) {
                 args = '-Sx12';
@@ -361,6 +396,12 @@ async function compress({ inputs, options, optimize, outputPath, verbose }) {
             }
             if (typeof combined.recipLearningRate === 'number') {
                 args = `-Zlr${combined.recipLearningRate} ${args}`;
+            }
+            if (typeof combined.pairRecipLearningRate === 'number') {
+                args = `-Zlp${combined.pairRecipLearningRate} ${args}`;
+            }
+            if (typeof combined.contextBits === 'number') {
+                args = `-Zco${combined.contextBits} ${args}`;
             }
             if (typeof combined.dynamicModels === 'number') {
                 args = `-Zdy${combined.dynamicModels} ${args}`;
@@ -478,4 +519,3 @@ switch (parsed.command) {
         usage(parsed.verbose);
         process.exit(1);
 }
-
