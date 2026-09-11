@@ -69,6 +69,11 @@ class AdaptiveZopfliScore {
             return Number(this) - Number(other);
         }
 
+        if (this.input === other.input) {
+            this.sizes = other.sizes;
+            return 0;
+        }
+
         for (
             // 1, 4, 16, 64 (128 is handled by the fallback)
             let iterations = 1;

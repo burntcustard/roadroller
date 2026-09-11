@@ -1565,6 +1565,8 @@ export class Packer {
         }
         level = level || 1;
 
+        const localSearch = level >= 2;
+
         const performance = await getPerformanceObject();
         const copy = v => JSON.parse(JSON.stringify(v));
 
@@ -1587,11 +1589,43 @@ export class Packer {
         };
 
         const cache = new Map(); // `${dynamicModels},${numAbbreviations}` -> { preparedText, preparedJs }
-        const mainInputAction = (this.inputsByType['text'] || this.inputsByType['js'])[0].action;
+        const scoreCache =
+            this.optimizeScoreCache ??=
+            new Map();
+
+        const mainInputAction =
+            (this.inputsByType['text'] ||
+            this.inputsByType['js'])[0].action;
 
         let maxAbbreviations = -1;
         const calculateSize = current => {
-            const options = { ...this.options, ...current };
+            const options = {
+                ...this.options,
+                ...current,
+            };
+
+            const scoreKey = JSON.stringify([
+                options.dynamicModels,
+                options.numAbbreviations,
+                options.sparseSelectors,
+                options.precision,
+                options.modelMaxCount,
+                options.modelRecipBaseCount,
+                options.recipLearningRate,
+                options.pairRecipLearningRate,
+                options.contextBits,
+                options.maxMemoryMB,
+            ]);
+
+            if (scoreCache.has(scoreKey)) {
+                const cached = scoreCache.get(scoreKey);
+
+                if (maxAbbreviations < 0) {
+                    maxAbbreviations = cached.maxAbbreviations;
+                }
+
+                return cached.score;
+            }
 
             const key = `${options.dynamicModels},${options.numAbbreviations}`;
             if (!cache.has(key)) {
@@ -1601,14 +1635,30 @@ export class Packer {
             }
 
             const { preparedText, preparedJs } = cache.get(key);
-            const result = Packer.doPack(preparedText, preparedJs, mainInputAction, options);
-            if (maxAbbreviations < 0) maxAbbreviations = result.maxAbbreviations;
+            const result = Packer.doPack(
+                preparedText,
+                preparedJs,
+                mainInputAction,
+                options
+            );
+
+            if (maxAbbreviations < 0) {
+                maxAbbreviations =
+                    result.maxAbbreviations;
+            }
 
             const packed = new Packed(result);
 
-            return options.optimizeScore
+            const score = options.optimizeScore
                 ? options.optimizeScore(packed, options)
                 : packed.estimateLength();
+
+            scoreCache.set(scoreKey, {
+                score,
+                maxAbbreviations: result.maxAbbreviations,
+            });
+
+            return score;
         };
 
         const reportProgress = async (pass, passRatio, current, currentSize, currentRejected, bestUpdated) => {
@@ -1651,7 +1701,7 @@ export class Packer {
         // the way to pick three points depends on the distribution and affects the search performance.
         const EXP = 1;
         const LINEAR = 0;
-        const search = async (lo, hi, dist, manualValues, score) => {
+        const search = async (lo, hi, dist, manualValues, score, anchor) => {
             if (level <= 1) {
                 for (let i = 0; i < manualValues.length; ++i) {
                     await score(manualValues[i], i / manualValues.length);
@@ -1687,12 +1737,23 @@ export class Packer {
 
             let q2 = mid(lo, hi);
             while (hi - lo >= 4) {
-                const xx = [lo, mid(lo, q2), q2, mid(q2, hi), hi];
+                const xx = [
+                    ...new Set([
+                        lo,
+                        mid(lo, q2),
+                        q2,
+                        mid(q2, hi),
+                        hi,
+                        anchor,
+                    ].filter(x => x >= lo && x <= hi))
+                ].sort((a, b) => a - b);
                 const yy = [];
-                for (const x of xx) yy.push(await evaluate(x));
+                for (const x of xx) {
+                    yy.push(await evaluate(x));
+                }
 
                 let min = 0;
-                for (let i = 1; i < 5; ++i) {
+                for (let i = 1; i < xx.length; ++i) {
                     if (compareSizes(yy[min], yy[i]) > 0) {
                         min = i;
                     }
@@ -1700,8 +1761,8 @@ export class Packer {
                 if (min === 0) {
                     hi = xx[1];
                     q2 = mid(lo, hi);
-                } else if (min === 4) {
-                    lo = xx[3];
+                } else if (min === xx.length - 1) {
+                    lo = xx[min - 1];
                     q2 = mid(lo, hi);
                 } else {
                     lo = xx[min - 1];
@@ -1714,14 +1775,36 @@ export class Packer {
         };
 
         // optimize modelRecipBaseCount
-        await search(1, 1000, EXP, [10, 20, 50, 100], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, modelRecipBaseCount: i }, 'modelRecipBaseCount', ratio);
-        });
+        const expRange = (value, lo, hi) =>
+            localSearch
+                ? [
+                    Math.max(lo, Math.floor(value * .67)),
+                    Math.min(hi, Math.ceil(value * 1.5)),
+                ]
+                : [lo, hi];
+
+        const linearRange = (value, lo, hi, radius) =>
+            localSearch
+                ? [
+                    Math.max(lo, value - radius),
+                    Math.min(hi, value + radius),
+                ]
+                : [lo, hi];
+
+        {
+            const [lo, hi] = expRange(this.options.modelRecipBaseCount, 1, 1000);
+            await search(lo, hi, EXP, [10, 20, 50, 100], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, modelRecipBaseCount: i }, 'modelRecipBaseCount', ratio);
+            });
+        }
 
         // optimize modelMaxCount
-        await search(1, 32767, EXP, [4, 5, 6], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, modelMaxCount: i }, 'modelMaxCount', ratio);
-        });
+        {
+            const [lo, hi] = expRange(this.options.modelMaxCount, 1, 32767);
+            await search(lo, hi, EXP, [4, 5, 6], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, modelMaxCount: i }, 'modelMaxCount', ratio);
+            });
+        }
         if (best.modelMaxCount === this.options.modelMaxCount) delete best.modelMaxCount;
 
         // optimize dynamicModels
@@ -1731,9 +1814,12 @@ export class Packer {
         if (best.dynamicModels === this.options.dynamicModels) delete best.dynamicModels;
 
         // optimize numAbbreviations
-        await search(0, maxAbbreviations, LINEAR, [0, 16, 32, 64], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, numAbbreviations: i }, 'numAbbreviations', ratio);
-        });
+        {
+            const [lo, hi] = linearRange(this.options.numAbbreviations, 0, maxAbbreviations, 8);
+            await search(lo, hi, LINEAR, [0, 16, 32, 64], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, numAbbreviations: i }, 'numAbbreviations', ratio);
+            });
+        }
         if (best.numAbbreviations === this.options.numAbbreviations) delete best.numAbbreviations;
 
         // optimize sparseSelectors by simulated annealing
@@ -1745,11 +1831,14 @@ export class Packer {
         while (temperature > targetTemperature) {
             const next = current.slice();
 
+            const index = Math.random() * next.length | 0;
             let added;
             do {
-                added = Math.random() * AUTO_SELECTOR_LIMIT | 0;
+                added = Math.random() < .8
+                    ? next[index] ^ (1 << (Math.random() * 9 | 0))
+                    : Math.random() * AUTO_SELECTOR_LIMIT | 0;
             } while (next.includes(added));
-            next[Math.random() * next.length | 0] = added;
+            next[index] = added;
             next.sort((a, b) => a - b);
 
             const { size: nextSize, bestUpdated } = updateBest({ ...best, sparseSelectors: next });
@@ -1764,25 +1853,67 @@ export class Packer {
                 currentSize = nextSize;
             }
 
-            temperature *= 0.99;
+            temperature *= 0.97;
         }
 
         // optimize precision
-        await search(1, 21, LINEAR, [12, 14, 16], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, precision: i }, 'precision', ratio);
-        });
+        {
+            const [lo, hi] = linearRange(this.options.precision, 1, 21, 3);
+            await search(lo, hi, LINEAR, [12, 14, 16], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, precision: i }, 'precision', ratio);
+            });
+        }
         if (best.precision === this.options.precision) delete best.precision;
 
+        // Search the learning-rate scale jointly at cheap decoder multipliers.
+        // Independent steps usually lose the short literal for their ratio, even
+        // when moving both rates together would improve the packed size.
+        {
+            const learningRate = best.recipLearningRate ?? this.options.recipLearningRate;
+            const pairRate = best.pairRecipLearningRate ?? this.options.pairRecipLearningRate;
+            const currentFactor = learningRate / pairRate;
+            const factors = new Set([1, 2, 3, 4, 5, 6]);
+            if (Number.isInteger(currentFactor) && currentFactor <= 99999) {
+                factors.add(currentFactor);
+            }
+            for (const factor of factors) {
+                const limit = Math.floor(99999 / factor);
+                const clamp = value => Math.max(1, Math.min(limit, Math.round(value)));
+                // Freeze the reference scale across families rather than letting
+                // earlier improvements move the search window for later ones.
+                const center = clamp(learningRate / factor);
+                const [lo, hi] = expRange(center, 1, limit);
+                const manualValues = [...new Set([.75, 1, 1.25].map(scale => clamp(center * scale)))];
+                const score = async (i, ratio) => await updateBestAndReportProgress({
+                    ...best,
+                    recipLearningRate: i * factor,
+                    pairRecipLearningRate: i,
+                }, `learningRates×${factor}`, ratio);
+                // Also covers an anchor at a boundary or in a singleton range.
+                await score(center, 0);
+                await search(lo, hi, EXP, manualValues, score, center);
+            }
+        }
+
+        // Independently refine the winning rates, allowing non-integer ratios.
         // optimize recipLearningRate
-        await search(1, 99999, EXP, [500, 750, 1000, 1250, 1500], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, recipLearningRate: i }, 'recipLearningRate', ratio);
-        });
+        {
+            const center = best.recipLearningRate ?? this.options.recipLearningRate;
+            const [lo, hi] = expRange(center, 1, 99999);
+            await search(lo, hi, EXP, [500, 750, 1000, 1250, 1500], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, recipLearningRate: i }, 'recipLearningRate', ratio);
+            }, center);
+        }
         if (best.recipLearningRate === this.options.recipLearningRate) delete best.recipLearningRate;
 
         // optimize pairRecipLearningRate
-        await search(1, 99999, EXP, [250, 400, 500, 750, 1000], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, pairRecipLearningRate: i }, 'pairRecipLearningRate', ratio);
-        });
+        {
+            const center = best.pairRecipLearningRate ?? this.options.pairRecipLearningRate;
+            const [lo, hi] = expRange(center, 1, 99999);
+            await search(lo, hi, EXP, [250, 400, 500, 750, 1000], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, pairRecipLearningRate: i }, 'pairRecipLearningRate', ratio);
+            }, center);
+        }
         if (best.pairRecipLearningRate === this.options.pairRecipLearningRate) delete best.pairRecipLearningRate;
 
         // apply the final result to this

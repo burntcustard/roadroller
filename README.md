@@ -141,6 +141,8 @@ The actual memory usage can be as low as a half of the specified due to the inte
 
 **Learning rate** (CLI `-Zlr|--learning-rate RATE`, API `recipLearningRate` in the options object) adjusts how fast would the context mixer adapt, where smaller is faster. The default is 500 which should be fine for long enough inputs. If your demo is smaller than 10 KB you can also try smaller numbers.
 
+The optimizer also searches the ordinary and pair learning rates together, keeping `recipLearningRate / pairRecipLearningRate` at integer factors 1 through 6 (plus the current integer factor, if within the search bounds). These ratios produce short multipliers in the generated decoder. Level 1 samples a few scales for each factor; higher levels refine each scale locally. Independent rate searches then allow non-integer ratios to win when they produce a better score. The existing rate options retain their meanings.
+
 **Model max count** (CLI `-Zmc|--model-max-count COUNT`, API `modelMaxCount` in the options object) adjusts how fast would individual contexts adapt, where smaller is faster. The model adapts fastest when a particular context is first seen, but that process becomes slower as the context is seen multiple times. This parameter limits how slowest the adaptation process can be. The default of 5 is specifically tuned for JS code inputs.
 
 **Model base divisor** (CLI `-Zmd|--model-base-divisor DIVISOR`, API `modelRecipBaseCount` in the options object) adjusts how fast should individual contexts adapt *initially*, where larger is faster. The optimal value typically ranges from 10 to 100 for JS code inputs.
@@ -202,4 +204,3 @@ The Roadroller compressor proper is licensed under the MIT license. In addition 
 [DEFLATE]: https://en.wikipedia.org/wiki/Deflate
 [Logistic context mixing]: https://en.wikipedia.org/wiki/Context_mixing#Logistic_Mixing
 [rANS]: https://en.wikipedia.org/wiki/Asymmetric_numeral_systems#Range_variants_(rANS)_and_streaming
-

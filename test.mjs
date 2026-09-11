@@ -412,6 +412,31 @@ test('Packer', t => {
     t.is(packAndReturn('3 + 4 * 5', { allowFreeVars: true }), '3+4*5');
 });
 
+for (const [level, targetRate, targetPairRate] of [[1, 1876, 469], [2, 1600, 400]]) {
+    test(`optimizer escapes independent learning-rate minimum (level ${level})`, async t => {
+        const packer = new Packer([{ type: 'text', action: 'return', data: 'coupled learning rates' }], {
+            maxMemoryMB: 1,
+            sparseSelectors: [0],
+            recipLearningRate: 1500,
+            pairRecipLearningRate: 500,
+            optimizeScore: (_, options) => {
+                const lr = options.recipLearningRate;
+                const lp = options.pairRecipLearningRate;
+                // Neither independent move can leave the initial local minimum.
+                if (lr === 1500 && lp === 500) return 100;
+                if (lr / lp !== 4) return 200;
+                return Math.abs(lp - targetPairRate);
+            },
+        });
+        const result = await packer.optimize(level);
+        t.is(result.bestSize, 0);
+        t.is(packer.options.recipLearningRate, targetRate);
+        t.is(packer.options.pairRecipLearningRate, targetPairRate);
+        const { firstLine, secondLine } = packer.makeDecoder();
+        t.is(Function(`return ${firstLine}${secondLine}`)(), 'coupled learning rates');
+    });
+}
+
 test('abbreviations', t => {
     t.is(packAndEval(`
         const alpha = 42;
@@ -497,4 +522,3 @@ test('parameter agility', t => {
     t.is(packAndEval('3 + 4 * 5', { modelMaxCount: 1 }), 23);
     t.is(packAndEval('3 + 4 * 5', { modelMaxCount: 32767 }), 23);
 });
-
