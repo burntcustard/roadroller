@@ -825,7 +825,7 @@ export const defaultSparseSelectors = (numContexts = 12) => {
 //------------------------------------------------------------------------------
 
 const predictionBytesPerContext = options => (options.precision <= 8 ? 1 : options.precision <= 16 ? 2 : 4);
-const countBytesPerContext = options => (options.modelMaxCount < 128 ? 1 : options.modelMaxCount < 32768 ? 2 : 4);
+const countBytesPerContext = options => (options.modelMaxCount < 128 && !options.useUint16Counts ? 1 : options.modelMaxCount < 32768 ? 2 : 4);
 
 const contextBitsFromMaxMemory = options => {
     const bytesPerContext = predictionBytesPerContext(options) + countBytesPerContext(options);
@@ -861,6 +861,9 @@ export class Packer {
             dynamicModels: options.dynamicModels,
             allowFreeVars: options.allowFreeVars,
             disableWasm: options.disableWasm,
+            useUint16Counts: !!options.useUint16Counts,
+            optimizePrefix: options.optimizePrefix || '',
+            optimizeSuffix: options.optimizeSuffix || '',
             optimizeScore: options.optimizeScore,
         };
 
@@ -1175,15 +1178,15 @@ export class Packer {
             pairRecipLearningRate;
 
         const byteWeightIndex =
-            `(ο[λ-1]||0)*${numModels}+μ+${mixerByteOffset}`;
+            `(ο[λ-1]||0)*${numModels}+τ+${mixerByteOffset}`;
 
         const pairWeightIndex =
             `((ο[λ-1]||0)*${mixerAlphabetSize}` +
             `+(ο[λ-2]||0))*${numModels}` +
-            `+μ+${mixerPairOffset}`;
+            `+τ+${mixerPairOffset}`;
 
         const prefixWeightIndex =
-            `ν*${numModels}+μ+${mixerPrefixOffset}`;
+            `ν*${numModels}+τ+${mixerPrefixOffset}`;
 
         const predictionBits = 8 * predictionBytesPerContext(compressOptions);
         const countBits = 8 * countBytesPerContext(compressOptions);
@@ -1198,6 +1201,11 @@ export class Packer {
         }
         const singleDigitSelectors = sparseSelectors.every(sel => sel < 512);
         const quotes = [...quotesSeen].sort((a, b) => a - b);
+        const quoteStart = quotes.length === 0 ? '' :
+            quotes.length === 1 ? `ν==${quotes[0]}&&ν` :
+            inBits === 7 && quotes.length === 2 && quotes[0] === 34 && quotes[1] === 96
+                ? `ν%62==34&&ν`
+                : `(${quotes.map(q => `ν==${q}`).join('|')})&&ν`;
 
         // 2+ decimal points doesn't seem to make any difference after DEFLATE
         const modelBaseCount = { 1: '1', 2: '.5', 5: '.2', 10: '.1' }[modelRecipBaseCount] || `1/${modelRecipBaseCount}`;
@@ -1344,9 +1352,7 @@ export class Packer {
                     `ν-χ&&χ:` +
                     // otherwise we set χ to ν if ν is one of opening quotes
                     // (we only process quotes that actually have appeared in the input)
-                    (quotes.length > 1 ?
-                        `(${quotes.map(q => `ν==${q}`).join('|')})&&ν` :
-                        `ν==${quotes[0]}&&ν`)
+                    quoteStart
             :
                 // same as above but don't need to keep ν
                 `ο[λ++]=ν-${1 << inBits}`
@@ -1363,15 +1369,15 @@ export class Packer {
                 // 6. calculate the mixed prediction Σ
                 //
                 // δ: context hash
-                // μ: model index 
+                // τ: model index
                 // α: scratch variable
                 // ε: stretched probabilities later used by prediction adjustment
-                `ε=φ.map((δ,μ)=>(` +
+                `ε=φ.map((δ,τ)=>(` +
                     `α=π[δ]*2+1,` +
                     `α=Math.log(α/(θ-α)),` +
 
                     `Σ-=(` +
-                        `ω[μ]+` +
+                        `ω[τ]+` +
                         `ω[${byteWeightIndex}]+` +
                         `ω[${pairWeightIndex}]+` +
                         `ω[${prefixWeightIndex}]` +
@@ -1392,9 +1398,9 @@ export class Packer {
                 // 8. update contexts and weights with β and ν (which is now the bit context)
                 //
                 // δ: context hash
-                // μ: model index (unique in the entire code)
+                // τ: local model index, shadowing the rANS state
                 // also makes use of φ and ε below.
-                `φ.map((δ,μ)=>(` +
+                `φ.map((δ,τ)=>(` +
                     // update the bitwise context.
                     // α is not used but used here to exploit a repeated code fragment
                     `α=π[δ]+=` +
@@ -1404,8 +1410,8 @@ export class Packer {
                         // we've already verified delta is within +/-2^31, so `>>>` is not required
                         `>>${29 - precision},` +
                     // update the weight
-                    `α=ε[μ]*(β-Σ/θ),` +
-                    `ω[μ]+=α,` +
+                    `α=ε[τ]*(β-Σ/θ),` +
+                    `ω[τ]+=α,` +
                     `ω[${byteWeightIndex}]+=α,` +
                     `ω[${pairWeightIndex}]+=α*${pairLearningFactor},` +
                     `ω[${prefixWeightIndex}]+=α` +
@@ -1423,19 +1429,21 @@ export class Packer {
                     `φ='${selectors.map(i => i.join('')).join('0')}'.split(Σ=0)`
                 :
                     `Σ=0,φ=${JSON.stringify(selectors)}`
-                ) + `.map((δ,μ)=>` +
+                ) + `.map((δ,τ)=>` +
                     // δ: an array of context offsets (1: last byte, 2: second-to-last byte, ...)
-                    // μ: model index 
+                    // τ: model index
                     // α: context hash accumulator
                     `(` +
                         `α=0,` +
-                        `${singleDigitSelectors ? `[...δ]` : `δ`}.map((δ,μ)=>` +
+                        `${singleDigitSelectors ? `[...δ]` : `δ`}.map((δ,τ)=>` +
                             // δ: context offset
                             // redundant argument and parentheses exploit a common code fragment
-                            `(α=α*997+(ο[λ-δ]|0)|0)` +
+                            // Descending offsets put missing history first; the
+                            // outer |0 resets NaN before valid bytes are hashed.
+                            `(α=α*997+ο[λ-δ]|0)` +
                         `),` +
                         `${pow2(contextBits)}-1&α*997+ν${quotes.length > 0 ? '+!!χ*129' : ''}` +
-                    `)*${numModels}+μ` +
+                    `)*${numModels}+τ` +
                 `)` +
             `;` +
 
@@ -1471,8 +1479,7 @@ export class Packer {
                 const abbrCharClass = (abbrCharClass2.length < abbrCharClass1.length ? abbrCharClass2 : abbrCharClass1);
                 secondLine +=
                     `for(κ=${stringifiedInput()};π=/[${abbrCharClass}]/.exec(κ);)` +
-                        `with(κ.split(π))` +
-                            `κ=join(shift());`;
+                        `κ=κ.split(π),κ=κ.join(κ.shift());`;
             }
         }
 
@@ -1589,6 +1596,11 @@ export class Packer {
         };
 
         const cache = new Map(); // `${dynamicModels},${numAbbreviations}` -> { preparedText, preparedJs }
+        // Scores from different callbacks are not interchangeable across runs.
+        if (this.optimizeScoreFunction !== this.options.optimizeScore) {
+            this.optimizeScoreCache = new Map();
+            this.optimizeScoreFunction = this.options.optimizeScore;
+        }
         const scoreCache =
             this.optimizeScoreCache ??=
             new Map();
@@ -1615,6 +1627,11 @@ export class Packer {
                 options.pairRecipLearningRate,
                 options.contextBits,
                 options.maxMemoryMB,
+                options.useUint16Counts,
+                options.optimizePrefix,
+                options.optimizeSuffix,
+                options.allowFreeVars,
+                options.disableWasm,
             ]);
 
             if (scoreCache.has(scoreKey)) {
@@ -1649,8 +1666,10 @@ export class Packer {
 
             const packed = new Packed(result);
 
+            const optimizeInput = options.optimizePrefix + packed.firstLine +
+                packed.secondLine + options.optimizeSuffix;
             const score = options.optimizeScore
-                ? options.optimizeScore(packed, options)
+                ? options.optimizeScore(optimizeInput, packed, options)
                 : packed.estimateLength();
 
             scoreCache.set(scoreKey, {
@@ -1666,7 +1685,11 @@ export class Packer {
 
             const info = {
                 pass, passRatio,
-                current, currentSize: Number(currentSize), currentRejected,
+                current, currentSize: Number(currentSize),
+                // Logging only reads stronger results already cached by comparison.
+                currentSize100: currentSize?.cachedSizeAt?.(100),
+                currentSize1000: currentSize?.cachedSizeAt?.(1000),
+                currentRejected,
                 best, bestSize: Number(bestSize), bestUpdated,
             };
             if (await progress(info) === false) throw new Error('search aborted');

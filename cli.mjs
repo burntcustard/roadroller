@@ -59,8 +59,14 @@ Output options:
   with the best parameters so far.
 --zopfli
   Uses actual Zopfli DEFLATE size for optimization.
-  Equal-size candidates are progressively compared at
-  1, 2, 4, 8, 16, 32, 64 and 128 iterations.
+  Candidates within 8 bytes at 1 iteration are compared at 100 iterations.
+  Candidates within 4 bytes at 100 iterations are compared at 1000 iterations.
+  Logs show 1/100/1000-iteration sizes when already calculated;
+  logging itself does not trigger additional compression.
+--optimize-wrapper FILE
+  Scores candidates within FILE, which must contain exactly one
+  __ROADROLLER__ marker. Currently requires --zopfli.
+  The wrapper affects scoring only; output remains packed JavaScript.
 -M|--max-memory MEGABYTES [Range: 10..1024, Default: 150]
   Configures the maximum memory usage.
   The actual usage might be lower. Use -v to print the actual usage.
@@ -108,6 +114,10 @@ Output options:
   is made smaller and the model would behave much quicker initially.
 -Zpr|--precision BITS [Range: 1..21, Default: 16]
   Sets the precision of internal fixed point representations.
+-Zuc|--uint16-counts [Default: false]
+  Uses Uint16Array for count tables that would otherwise use Uint8Array.
+  This may reduce compressed decoder size at the cost of additional
+  memory and initialization time.
 ` : '') + `
 Other options:
 -q|--silent
@@ -216,6 +226,23 @@ async function parseArgs(args) {
                 throw 'duplicate --zopfli arguments';
             }
             useZopfli = true;
+        } else if (matchOpt('uint16-counts', 'Zuc')) {
+            if (options.useUint16Counts !== undefined) throw 'duplicate --uint16-counts arguments';
+            options.useUint16Counts = true;
+        } else if (m = matchOptArg('optimize-wrapper')) {
+            if (options.optimizePrefix !== undefined) throw 'duplicate --optimize-wrapper arguments';
+            const path = getArg(m);
+            let wrapper;
+            try {
+                wrapper = fs.readFileSync(path, { encoding: 'utf-8' });
+            } catch {
+                throw `cannot read optimize wrapper ${path}`;
+            }
+            const parts = wrapper.split('__ROADROLLER__');
+            if (parts.length !== 2) {
+                throw '--optimize-wrapper must contain exactly one __ROADROLLER__ marker';
+            }
+            [options.optimizePrefix, options.optimizeSuffix] = parts;
         } else if (m = matchOptArg('max-memory', 'M')) {
             if (options.maxMemoryMB !== undefined) throw 'duplicate --max-memory arguments';
             options.maxMemoryMB = parseInt(getArg(m), 10);
@@ -333,6 +360,10 @@ async function parseArgs(args) {
         throw 'invalid --precision argument';
     }
 
+    if (options.optimizePrefix !== undefined && !useZopfli) {
+        throw '--optimize-wrapper currently requires --zopfli';
+    }
+
     if (!command && inputs.length === 0) {
         command = 'default';
     }
@@ -388,6 +419,9 @@ async function compress({ inputs, options, optimize, useZopfli, outputPath, verb
             if (typeof combined.precision === 'number') {
                 args = `-Zpr${combined.precision} ${args}`;
             }
+            if (combined.useUint16Counts) {
+                args = `-Zuc ${args}`;
+            }
             if (typeof combined.modelRecipBaseCount === 'number') {
                 args = `-Zmd${combined.modelRecipBaseCount} ${args}`;
             }
@@ -426,11 +460,14 @@ async function compress({ inputs, options, optimize, useZopfli, outputPath, verb
             result = await packer.optimize(level, async info => {
                 await new Promise(resolve => setImmediate(resolve)); // allow signals to be delivered
                 if (verbose >= 0) {
+                    let size = `${info.currentSize}`;
+                    if (info.currentSize100 !== undefined) size += `/${info.currentSize100}`;
+                    if (info.currentSize1000 !== undefined) size += `/${info.currentSize1000}`;
                     console.warn(
                         `(${info.pass}` +
                         (typeof info.passRatio === 'number' ? ` ${(info.passRatio * 100).toFixed(1)}%` : '') +
                         `) ${format(info.current)}:`,
-                        info.currentSize, info.bestUpdated ? '<-' : info.currentRejected ? 'x' : '');
+                        size, info.bestUpdated ? '<-' : info.currentRejected ? 'x' : '');
                 }
                 if (stop) {
                     result = info;

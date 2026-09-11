@@ -143,6 +143,20 @@ The actual memory usage can be as low as a half of the specified due to the inte
 
 The optimizer also searches the ordinary and pair learning rates together, keeping `recipLearningRate / pairRecipLearningRate` at integer factors 1 through 6 (plus the current integer factor, if within the search bounds). These ratios produce short multipliers in the generated decoder. Level 1 samples a few scales for each factor; higher levels refine each scale locally. Independent rate searches then allow non-integer ratios to win when they produce a better score. The existing rate options retain their meanings.
 
+**16-bit count tables** (CLI `-Zuc|--uint16-counts`, API `useUint16Counts`, default `false`) use `Uint16Array` where the generated decoder would normally use `Uint8Array`. This can reduce compressed decoder size, at the cost of more table memory and initialization work. Memory budgeting accounts for the wider table. Larger count tables are unchanged, and this flag does not disable default optimization.
+
+**Optimization wrappers** (CLI `--optimize-wrapper FILE`, API `optimizePrefix` and `optimizeSuffix`) supply the surrounding content when scoring a candidate. The wrapper file must contain exactly one `__ROADROLLER__` marker, for example `<script>__ROADROLLER__</script>`. The CLI currently requires `--zopfli` for this option:
+
+```sh
+roadroller --zopfli --optimize-wrapper page-wrapper.html -Zuc -O1 input.js -o packed.js
+```
+
+The wrapper affects scoring only: `packed.js` and `makeDecoder()` still contain only Roadroller output. The legacy size estimator remains unchanged and does not score wrapper content.
+
+Custom API scorers now receive `optimizeScore(input, packed, options)`, where `input` is exactly `optimizePrefix + packed.firstLine + packed.secondLine + optimizeSuffix`. This replaces the previous `(packed, options)` callback signature. A scorer may return a number or an object with `valueOf()` and `compare(other)` methods. `createZopfliPackedScore()` from `zopfli.mjs` accepts this complete input, comparing candidates first at 1 iteration. Differences greater than 8 bytes use that quick result; candidates within 8 bytes are compared at 100 iterations. Candidates within 4 bytes at 100 iterations are compared at 1000 iterations, with remaining ties broken by UTF-8 input length. Numeric score conversions still use the 1-iteration result.
+
+Optimization logs show `12775` for a candidate with only a 1-iteration result, `12758/12751` for cached 1/100-iteration results, or `12755/12752/12750` for cached 1/100/1000-iteration results. Logging never triggers the stronger compression passes. API progress exposes these optional cached results as `currentSize100` and `currentSize1000`, while `currentSize` remains the numeric quick score.
+
 **Model max count** (CLI `-Zmc|--model-max-count COUNT`, API `modelMaxCount` in the options object) adjusts how fast would individual contexts adapt, where smaller is faster. The model adapts fastest when a particular context is first seen, but that process becomes slower as the context is seen multiple times. This parameter limits how slowest the adaptation process can be. The default of 5 is specifically tuned for JS code inputs.
 
 **Model base divisor** (CLI `-Zmd|--model-base-divisor DIVISOR`, API `modelRecipBaseCount` in the options object) adjusts how fast should individual contexts adapt *initially*, where larger is faster. The optimal value typically ranges from 10 to 100 for JS code inputs.

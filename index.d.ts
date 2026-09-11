@@ -135,6 +135,10 @@ export interface OptimizerProgressInfo<Params = number[]> {
     passRatio?: number;
     current: Params;
     currentSize: number;
+    /** Cached Zopfli-100 size, if already calculated; logging does not compute it. */
+    currentSize100?: number;
+    /** Cached Zopfli-1000 size, if already calculated; logging does not compute it. */
+    currentSize1000?: number;
     currentRejected: boolean;
     best: Params;
     bestSize: number[];
@@ -191,6 +195,16 @@ export interface PackerOptions {
     numAbbreviations?: number;
     dynamicModels?: number; // bit flags out of DynamicModelFlags
     allowFreeVars?: boolean;
+    useUint16Counts?: boolean;
+    /** Fitness context only; not included in makeDecoder() output or the legacy estimate. */
+    optimizePrefix?: string;
+    optimizeSuffix?: string;
+    /** Receives prefix + firstLine + secondLine + suffix. */
+    optimizeScore?: (input: string, packed: Packed, options: PackerOptions) => number | {
+        valueOf(): number;
+        compare(other: any): number;
+        cachedSizeAt?(iterations: number): number | undefined;
+    };
 }
 
 export interface OptimizedPackerOptions {
@@ -226,4 +240,3 @@ export interface Packed {
     readonly freeVars: string[];
     estimateLength(): number;
 }
-

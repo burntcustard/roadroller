@@ -1,5 +1,10 @@
 import test from 'ava';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { spawnSync } from 'child_process';
+import { createZopfliPackedScore, zopfliDeflatedSize } from './zopfli.mjs';
 import {
     ResourcePool, AnsEncoder, AnsDecoder, DirectContextModel, DefaultModel, Packer,
     compressWithModel, compressWithDefaultModel, decompressWithModel
@@ -419,7 +424,7 @@ for (const [level, targetRate, targetPairRate] of [[1, 1876, 469], [2, 1600, 400
             sparseSelectors: [0],
             recipLearningRate: 1500,
             pairRecipLearningRate: 500,
-            optimizeScore: (_, options) => {
+            optimizeScore: (_, packed, options) => {
                 const lr = options.recipLearningRate;
                 const lp = options.pairRecipLearningRate;
                 // Neither independent move can leave the initial local minimum.
@@ -521,4 +526,125 @@ test('parameter agility', t => {
     t.is(packAndEval('3 + 4 * 5', { precision: 21 }), 23);
     t.is(packAndEval('3 + 4 * 5', { modelMaxCount: 1 }), 23);
     t.is(packAndEval('3 + 4 * 5', { modelMaxCount: 32767 }), 23);
+});
+
+// Native decoder generation and wrapper-aware scoring.
+test('native decoder quote shortcut is restricted to 7-bit input', t => {
+    for (const data of ['"hello" `world`', '"hello" `world`\x9e\xdc']) {
+        for (const allowFreeVars of [false, true]) {
+            const options = { type: 'text', dynamicModels: 1, allowFreeVars, sparseSelectors: [0, 5, 513] };
+            t.is(packAndReturn(data, options), data);
+            t.is(pack(data, options).secondLine.includes('%62==34'), !data.includes('\x9e'));
+        }
+    }
+});
+
+test('native abbreviation loop retains short branches', t => {
+    const data = 'const alpha=1,beta=2,gamma=3;[alpha,beta,gamma,alpha,beta,gamma]';
+    for (const numAbbreviations of [0, 1, 2, 3, 64]) {
+        const options = { numAbbreviations };
+        t.deepEqual(packAndEval(data, options), [1, 2, 3, 1, 2, 3]);
+        const packed = pack(data, options);
+        t.is(packed.secondLine.includes('with('), numAbbreviations > 0 && numAbbreviations < 3);
+    }
+});
+
+test('uint16 counts preserve decoding and account for table memory', t => {
+    const inputs = [{ type: 'text', action: 'return', data: 'count table test '.repeat(20) }];
+    for (const modelMaxCount of [4, 128, 32768]) {
+        const options = { contextBits: 8, sparseSelectors: [0, 1], modelMaxCount };
+        const normal = new Packer(inputs, options);
+        const wide = new Packer(inputs, { ...options, useUint16Counts: true });
+        const a = normal.makeDecoder(), b = wide.makeDecoder();
+        t.is(a.firstLine, b.firstLine);
+        t.is(b.secondLine, modelMaxCount < 128 ? a.secondLine.replace('Uint8Array', 'Uint16Array') : a.secondLine);
+        t.is(wide.memoryUsageMB / normal.memoryUsageMB, modelMaxCount < 128 ? 4 / 3 : 1);
+        t.is(Function(`return ${b.firstLine}${b.secondLine}`)(), inputs[0].data);
+    }
+    const options = { maxMemoryMB: 1, useUint16Counts: true };
+    t.true(new Packer(inputs, options).memoryUsageMB <= 1);
+});
+
+test('optimizer supplies exact wrapped input and invalidates incompatible scores', async t => {
+    let calls = 0;
+    const score = (input, packed, options) => {
+        ++calls;
+        t.is(input, options.optimizePrefix + packed.firstLine + packed.secondLine + options.optimizeSuffix);
+        return input.length;
+    };
+    const packer = new Packer([{ type: 'text', action: 'return', data: 'wrapper test' }], {
+        maxMemoryMB: 1, sparseSelectors: [0], optimizePrefix: '<script>',
+        optimizeSuffix: '</script>é', optimizeScore: score,
+    });
+    const initialOutput = packer.makeDecoder();
+    const initialOnly = async () => t.throwsAsync(packer.optimize(1, () => false), { message: 'search aborted' });
+    await initialOnly();
+    t.is(calls, 1);
+    await initialOnly();
+    t.is(calls, 1);
+    packer.options.optimizePrefix = '<body><script>';
+    await initialOnly();
+    t.is(calls, 2);
+    t.deepEqual(packer.makeDecoder(), initialOutput);
+    packer.options.useUint16Counts = true;
+    await initialOnly();
+    t.is(calls, 3);
+    packer.options.optimizeScore = (...args) => score(...args);
+    await initialOnly();
+    t.is(calls, 4);
+});
+
+test('Zopfli scores supplied UTF-8 input with byte-length tie breaking', t => {
+    const create = createZopfliPackedScore();
+    const input = '<script>"héllo"</script>';
+    const score = create(input);
+    t.is(Number(score), zopfliDeflatedSize(input));
+    t.is(score.fallback, Buffer.byteLength(input));
+    t.is(score.compare(create(input)), 0);
+    // Force ties to verify all refinement levels without expensive compression.
+    const steps = [];
+    score.sizeAt = iterations => { steps.push(iterations); return 10; };
+    const other = create('longer input '.repeat(5));
+    other.sizeAt = () => 10;
+    t.true(score.compare(other) < 0);
+    t.deepEqual(steps, [1, 100, 1000]);
+});
+
+test('CLI validates wrappers and keeps them out of output', t => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'roadroller-wrapper-'));
+    t.teardown(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const wrapper = path.join(dir, 'wrapper.html');
+    const output = path.join(dir, 'output.js');
+    const run = args => spawnSync(process.execPath, ['cli.mjs', ...args, '-t', 'js', '-'], {
+        input: '3+4', encoding: 'utf8',
+    });
+    fs.writeFileSync(wrapper, '<script>__ROADROLLER__</script>');
+    let result = run(['--optimize-wrapper', wrapper, '-O0']);
+    t.is(result.status, 1);
+    t.true(result.stderr.includes('currently requires --zopfli'), result.stderr);
+    for (const content of ['no marker', '__ROADROLLER____ROADROLLER__']) {
+        fs.writeFileSync(wrapper, content);
+        result = run(['--zopfli', '--optimize-wrapper', wrapper, '-O0']);
+        t.is(result.status, 1);
+        t.true(result.stderr.includes('exactly one __ROADROLLER__ marker'));
+    }
+    fs.writeFileSync(wrapper, '<script>__ROADROLLER__</script>');
+    result = run(['--zopfli', '--optimize-wrapper', wrapper, '--optimize-wrapper', wrapper]);
+    t.is(result.status, 1);
+    t.true(result.stderr.includes('duplicate --optimize-wrapper'));
+    result = run(['-Zuc', '--uint16-counts']);
+    t.is(result.status, 1);
+    t.true(result.stderr.includes('duplicate --uint16-counts'));
+    result = run(['--zopfli', '--optimize-wrapper', path.join(dir, 'missing')]);
+    t.is(result.status, 1);
+    t.true(result.stderr.includes('cannot read optimize wrapper'));
+    // -Zuc must leave the default optimization enabled. Verbose progress also
+    // reports the flag among the parameters needed to reproduce the decoder.
+    result = run(['--zopfli', '--optimize-wrapper', wrapper, '-Zuc', '-M10', '-o', output]);
+    t.is(result.status, 0, result.stderr);
+    t.true(result.stderr.includes('-Zuc'));
+    const code = fs.readFileSync(output, 'utf8');
+    t.false(code.includes('<script>'));
+    t.false(code.includes('</script>'));
+    t.is(Function(`return ${code}`)(), 7);
 });

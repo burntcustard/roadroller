@@ -14,16 +14,14 @@ export const zopfliDeflatedSize = (input, numiterations = 1) => {
     
 
 class AdaptiveZopfliScore {
-    constructor(packed) {
-        this.input =
-            packed.firstLine +
-            packed.secondLine;
+    constructor(input) {
+        this.input = input;
 
         this.sizes = new Map();
 
         // Only used if both candidates are still exactly tied
-        // after Zopfli-128.
-        this.fallback = packed.estimateLength();
+        // after Zopfli-1000.
+        this.fallback = Buffer.byteLength(input);
     }
 
     sizeAt(iterations) {
@@ -31,6 +29,11 @@ class AdaptiveZopfliScore {
             this.sizes.set(iterations, zopfliDeflatedSize(this.input, iterations));
         }
 
+        return this.sizes.get(iterations);
+    }
+
+    // Read cached results for logging without triggering compression.
+    cachedSizeAt(iterations) {
         return this.sizes.get(iterations);
     }
 
@@ -49,11 +52,9 @@ class AdaptiveZopfliScore {
     /*
      * Compare two candidates.
      *
-     * Start cheaply at one iteration. If they produce exactly the
-     * same compressed byte count, progressively increase the Zopfli
-     * effort until one candidate pulls ahead:
-     *
-     *   1 → 2 → 4 → 8 → 16 → 32 → 64 → 128
+     * Start at one iteration. Candidates within 8 bytes are compared
+     * at 100 iterations; candidates within 4 bytes there are compared at 1000.
+     * Remaining ties use UTF-8 input length.
      *
      * Results are cached, so repeated comparisons don't rerun an
      * iteration count already calculated for that candidate.
@@ -74,27 +75,20 @@ class AdaptiveZopfliScore {
             return 0;
         }
 
-        for (
-            // 1, 4, 16, 64 (128 is handled by the fallback)
-            let iterations = 1;
-            iterations <= 64;
-            iterations *= 4
-        ) {
-            const thisSize = this.sizeAt(iterations);
+        const quickDiff = this.sizeAt(1) - other.sizeAt(1);
+        // Trust the cheap result when candidates are more than 8 bytes apart.
+        if (Math.abs(quickDiff) > 8) return quickDiff;
 
-            const otherSize = other.sizeAt(iterations);
+        const diff100 = this.sizeAt(100) - other.sizeAt(100);
+        if (Math.abs(diff100) > 4) return diff100;
 
-            if (thisSize !== otherSize) {
-                return thisSize - otherSize;
-            }
-        }
+        // Within 4 bytes (inclusive) at 100 iterations, compare at 1000.
+        const diff1000 = this.sizeAt(1000) - other.sizeAt(1000);
+        if (diff1000) return diff1000;
 
-        // Extremely unlikely, but if Zopfli still gives exactly
-        // the same byte count at 128 iterations, use Roadroller's
-        // existing estimate as a deterministic final tie-breaker.
         return this.fallback - other.fallback;
     }
 }
 
 export const createZopfliPackedScore = () =>
-    packed => new AdaptiveZopfliScore(packed);
+    input => new AdaptiveZopfliScore(input);
