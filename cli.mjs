@@ -228,7 +228,6 @@ async function parseArgs(args) {
             options.sse = true;
         } else if (matchOpt('zopfli')) {
             if (useZopfli) {
-        const { createZopfliPackedScore } = await import('./zopfli.mjs');
                 throw 'duplicate --zopfli arguments';
             }
             useZopfli = true;
@@ -387,8 +386,8 @@ async function parseArgs(args) {
 
 async function compress({ inputs, options, optimize, useZopfli, outputPath, verbose }) {
     if (useZopfli) {
-        options.optimizeScore =
-            createZopfliPackedScore();
+        const { createZopfliPackedScore } = await import('./zopfli.mjs');
+        options.optimizeScore = createZopfliPackedScore();
     }
     let packer = new Packer(inputs, options);
     const origLength = inputs.reduce((acc, { data } ) => {
