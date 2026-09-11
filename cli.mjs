@@ -71,7 +71,8 @@ Output options:
   __ROADROLLER__ marker. Currently requires --zopfli.
   The wrapper affects scoring only; output remains packed JavaScript.
 -M|--max-memory MEGABYTES [Range: 10..1024, Default: 150]
-  Configures the maximum memory usage.
+  Configures primary context-table memory in decimal MB (1 MB = 1,000,000 bytes).
+  Includes the SSE word model; auxiliary mixer weights are additional.
   The actual usage might be lower. Use -v to print the actual usage.
 -D|--dirty [Default: false]
   Allow the decoder to pollute the global scope.
@@ -117,10 +118,6 @@ Output options:
   is made smaller and the model would behave much quicker initially.
 -Zpr|--precision BITS [Range: 1..21, Default: 16]
   Sets the precision of internal fixed point representations.
--Zuc|--uint16-counts [Default: false]
-  Uses Uint16Array for count tables that would otherwise use Uint8Array.
-  This may reduce compressed decoder size at the cost of additional
-  memory and initialization time.
 ` : '') + `
 Other options:
 -q|--silent
@@ -233,9 +230,6 @@ async function parseArgs(args) {
                 throw 'duplicate --zopfli arguments';
             }
             useZopfli = true;
-        } else if (matchOpt('uint16-counts', 'Zuc')) {
-            if (options.useUint16Counts !== undefined) throw 'duplicate --uint16-counts arguments';
-            options.useUint16Counts = true;
         } else if (m = matchOptArg('optimize-wrapper')) {
             if (options.optimizePrefix !== undefined) throw 'duplicate --optimize-wrapper arguments';
             const path = getArg(m);
@@ -428,9 +422,6 @@ async function compress({ inputs, options, optimize, useZopfli, outputPath, verb
             }
             if (combined.sse) {
                 args = `--sse ${args}`;
-            }
-            if (combined.useUint16Counts) {
-                args = `-Zuc ${args}`;
             }
             if (typeof combined.modelRecipBaseCount === 'number') {
                 args = `-Zmd${combined.modelRecipBaseCount} ${args}`;

@@ -553,22 +553,6 @@ test('native abbreviation loop retains short branches', t => {
     }
 });
 
-test('uint16 counts preserve decoding and account for table memory', t => {
-    const inputs = [{ type: 'text', action: 'return', data: 'count table test '.repeat(20) }];
-    for (const modelMaxCount of [4, 128, 32768]) {
-        const options = { contextBits: 8, sparseSelectors: [0, 1], modelMaxCount };
-        const normal = new Packer(inputs, options);
-        const wide = new Packer(inputs, { ...options, useUint16Counts: true });
-        const a = normal.makeDecoder(), b = wide.makeDecoder();
-        t.is(a.firstLine, b.firstLine);
-        t.is(b.secondLine, modelMaxCount < 128 ? a.secondLine.replace('Uint8Array', 'Uint16Array') : a.secondLine);
-        t.is(wide.memoryUsageMB / normal.memoryUsageMB, modelMaxCount < 128 ? 4 / 3 : 1);
-        t.is(Function(`return ${b.firstLine}${b.secondLine}`)(), inputs[0].data);
-    }
-    const options = { maxMemoryMB: 1, useUint16Counts: true };
-    t.true(new Packer(inputs, options).memoryUsageMB <= 1);
-});
-
 test('optimizer supplies exact wrapped input and invalidates incompatible scores', async t => {
     let calls = 0;
     const score = (input, packed, options) => {
@@ -590,15 +574,12 @@ test('optimizer supplies exact wrapped input and invalidates incompatible scores
     await initialOnly();
     t.is(calls, 2);
     t.deepEqual(packer.makeDecoder(), initialOutput);
-    packer.options.useUint16Counts = true;
-    await initialOnly();
-    t.is(calls, 3);
     packer.options.optimizeScore = (...args) => score(...args);
     await initialOnly();
-    t.is(calls, 4);
+    t.is(calls, 3);
     packer.options.sse = true;
     await initialOnly();
-    t.is(calls, 5);
+    t.is(calls, 4);
 });
 
 test('Zopfli scores supplied UTF-8 input with byte-length tie breaking', t => {
@@ -639,17 +620,14 @@ test('CLI validates wrappers and keeps them out of output', t => {
     result = run(['--zopfli', '--optimize-wrapper', wrapper, '--optimize-wrapper', wrapper]);
     t.is(result.status, 1);
     t.true(result.stderr.includes('duplicate --optimize-wrapper'));
-    result = run(['-Zuc', '--uint16-counts']);
-    t.is(result.status, 1);
-    t.true(result.stderr.includes('duplicate --uint16-counts'));
     result = run(['--zopfli', '--optimize-wrapper', path.join(dir, 'missing')]);
     t.is(result.status, 1);
     t.true(result.stderr.includes('cannot read optimize wrapper'));
-    // -Zuc must leave the default optimization enabled. Verbose progress also
+    // --sse must leave the default optimization enabled. Verbose progress also
     // reports the flag among the parameters needed to reproduce the decoder.
-    result = run(['--zopfli', '--optimize-wrapper', wrapper, '-Zuc', '-M10', '-o', output]);
+    result = run(['--zopfli', '--optimize-wrapper', wrapper, '--sse', '-M10', '-o', output]);
     t.is(result.status, 0, result.stderr);
-    t.true(result.stderr.includes('-Zuc'));
+    t.true(result.stderr.includes('--sse'));
     const code = fs.readFileSync(output, 'utf8');
     t.false(code.includes('<script>'));
     t.false(code.includes('</script>'));

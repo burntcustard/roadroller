@@ -14,6 +14,7 @@ export type ScaledFreq = number;
 export type Bit = 0 | 1;
 
 export interface AnsOptions {
+    sse?: boolean;
     outBits: number;
     precision: number;
 }
@@ -70,6 +71,12 @@ export class SparseContextModel implements DirectContextModel {
     update(actualBit: Bit, context?: number): void;
     flushByte(currentByte: number, inBits: number): void;
     release(): void;
+}
+
+export class WordContextModel extends DirectContextModel {
+    constructor(options: DirectContextModelOptions);
+    word: number;
+    sparseContext: number;
 }
 
 export interface LogisticMixModelOptions {
@@ -189,6 +196,7 @@ export interface PackerOptions {
     sse?: boolean;
     pairRecipLearningRate?: number;
     sparseSelectors?: number[];
+    /** Primary context-table budget in decimal MB (1 MB = 1,000,000 bytes). */
     maxMemoryMB?: number;
     contextBits?: number;
     precision?: number;
@@ -201,7 +209,6 @@ export interface PackerOptions {
     numAbbreviations?: number;
     dynamicModels?: number; // bit flags out of DynamicModelFlags
     allowFreeVars?: boolean;
-    useUint16Counts?: boolean;
     /** Fitness context only; not included in makeDecoder() output or the legacy estimate. */
     optimizePrefix?: string;
     optimizeSuffix?: string;

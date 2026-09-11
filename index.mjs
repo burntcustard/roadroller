@@ -122,7 +122,8 @@ const ANS_BITS = 28;
 
 // roughly based on https://github.com/rygorous/ryg_rans/blob/master/rans_byte.h
 export class AnsEncoder {
-    constructor({ outBits, precision }) {
+    constructor({ outBits, precision, sse = false }) {
+        this.initialStateOffset = sse && outBits === 6 ? SSE_ANS_TERMINAL_OFFSET : 0;
         // all input frequencies are assumed to be scaled by 2^precision
         this.precision = precision;
 
@@ -160,7 +161,7 @@ export class AnsEncoder {
 
         const outSymbols = this.outBits < 0 ? -this.outBits : 1 << this.outBits;
 
-        let state = 1 << (ANS_BITS - ceilLog2(outSymbols));
+        let state = (1 << (ANS_BITS - ceilLog2(outSymbols))) + this.initialStateOffset;
 
         const buf = [];
         const probScale = this.precision + 1;
@@ -386,6 +387,27 @@ export class SparseContextModel extends DirectContextModel {
     }
 }
 
+// Rolling word context, enabled as an extra default model with SSE.
+export class WordContextModel extends DirectContextModel {
+    constructor(options) {
+        super(options);
+        this.word = 0;
+        this.sparseContext = 0;
+    }
+    predict(context = 0) {
+        return super.predict(this.sparseContext + context);
+    }
+    update(actualBit, context = 0) {
+        super.update(actualBit, this.sparseContext + context);
+    }
+    flushByte(currentByte, inBits) {
+        super.flushByte(currentByte, inBits);
+        this.word = currentByte > 64 && currentByte < 123
+            ? (this.word * 997 + currentByte) | 0 : 0;
+        this.sparseContext = this.word * 997 | 0;
+    }
+}
+
 export class LogisticMixModel {
     constructor(models, { recipLearningRate, precision }) {
         this.models = models;
@@ -445,6 +467,9 @@ export class LogisticMixModel {
 }
 
 // Compact, opt-in secondary symbol estimation, shared by encoder and decoder.
+const SSE_WEIGHT_BIAS = 0.1;
+const SSE_ANS_TERMINAL_OFFSET = 917503;
+const numDefaultModels = options => options.sparseSelectors.length + (options.sse ? 1 : 0);
 const SSE_BINS = 8;
 const SSE_PREFIX_STRIDE = 6;
 const SSE_LOGIT_DIVISOR = 3;
@@ -545,6 +570,7 @@ export class ContextualLogisticMixModel extends LogisticMixModel {
 
             const weight =
                 this.weights[i] +
+                (this.sse ? SSE_WEIGHT_BIAS : 0) +
                 this.weights[this.byteWeightBase + i] +
                 this.weights[this.pairWeightBase + i] +
                 this.weights[this.prefixWeightBase + i];
@@ -632,6 +658,7 @@ export class DefaultModel extends ContextualLogisticMixModel {
         const models = sparseSelectors.map(sparseSelector => {
             return new SparseContextModel({ ...options, sparseSelector });
         });
+        if (options.sse) models.push(new WordContextModel(options));
         super(models, options);
 
         this.modelQuotes = modelQuotes;
@@ -844,16 +871,16 @@ export const defaultSparseSelectors = (numContexts = 12) => {
 //------------------------------------------------------------------------------
 
 const predictionBytesPerContext = options => (options.precision <= 8 ? 1 : options.precision <= 16 ? 2 : 4);
-const countBytesPerContext = options => (options.modelMaxCount < 128 && !options.useUint16Counts ? 1 : options.modelMaxCount < 32768 ? 2 : 4);
+const countBytesPerContext = options => (options.modelMaxCount < 128 ? 1 : options.modelMaxCount < 32768 ? 2 : 4);
 
 const contextBitsFromMaxMemory = options => {
     const bytesPerContext = predictionBytesPerContext(options) + countBytesPerContext(options);
-    let contextBits = floorLog2(options.maxMemoryMB * 1048576, options.sparseSelectors.length * bytesPerContext);
+    let contextBits = floorLog2(options.maxMemoryMB * 1000 * 1000, numDefaultModels(options) * bytesPerContext);
 
     // the decoder slightly overallocates the memory (~1%) so a naive calculation can exceed the memory limit;
     // recalculate the actual memory usage and decrease contextBits in that case.
-    const [, , actualNumContexts] = approximateWithTwoSigDigits(options.sparseSelectors.length << contextBits);
-    if (actualNumContexts * bytesPerContext > options.maxMemoryMB * 1048576) --contextBits;
+    const [, , actualNumContexts] = approximateWithTwoSigDigits(numDefaultModels(options) * 2 ** contextBits);
+    if (actualNumContexts * bytesPerContext > options.maxMemoryMB * 1000 * 1000) --contextBits;
 
     return contextBits;
 };
@@ -883,7 +910,6 @@ export class Packer {
             dynamicModels: options.dynamicModels,
             allowFreeVars: options.allowFreeVars,
             disableWasm: options.disableWasm,
-            useUint16Counts: !!options.useUint16Counts,
             sse: !!options.sse,
             optimizePrefix: options.optimizePrefix || '',
             optimizeSuffix: options.optimizeSuffix || '',
@@ -934,10 +960,10 @@ export class Packer {
     }
 
     get memoryUsageMB() {
-        const contextBits = this.options.contextBits || contextBitsFromMaxMemory(this.options);
-        const [, , numContexts] = approximateWithTwoSigDigits(this.options.sparseSelectors.length << contextBits);
+        const contextBits = this.options.contextBits ?? contextBitsFromMaxMemory(this.options);
+        const [, , numContexts] = approximateWithTwoSigDigits(numDefaultModels(this.options) * 2 ** contextBits);
         const bytesPerContext = predictionBytesPerContext(this.options) + countBytesPerContext(this.options);
-        return numContexts * bytesPerContext / 1048576;
+        return numContexts * bytesPerContext / (1000 * 1000);
     }
 
     static prepareText(inputs) {
@@ -1161,7 +1187,7 @@ export class Packer {
             allowFreeVars,
         } = options;
 
-        const contextBits = options.contextBits || contextBitsFromMaxMemory(options);
+        const contextBits = options.contextBits ?? contextBitsFromMaxMemory(options);
 
         const compressOptions = {
             ...options,
@@ -1173,7 +1199,7 @@ export class Packer {
         };
         const { buf, state, inputLength, bufLengthInBytes, quotesSeen } = compressWithDefaultModel(combinedInput, compressOptions);
 
-        const numModels = sparseSelectors.length;
+        const numModels = numDefaultModels(options);
 
         const mixerAlphabetSize = 1 << inBits;
 
@@ -1195,8 +1221,7 @@ export class Packer {
             `l=δ+((ο[λ-1]||0)+1<<${inBits + 3}),` +
             `Σ-=ω[δ]+ω[l],` : '';
         const sseUpdate = options.sse ?
-            `α=(β-Σ/θ)/${SSE_RECIP_LEARNING_RATE},` +
-            `ω[δ]+=α,` +
+            `ω[δ]+=α=(β-Σ/θ)/${SSE_RECIP_LEARNING_RATE},` +
             `ω[l]+=α*${SSE_BYTE_LEARNING_FACTOR},` : '';
 
         const pairLearningFactor =
@@ -1225,6 +1250,7 @@ export class Packer {
             }
             selectors.push(bits.reverse());
         }
+        if (options.sse) selectors.push(['w']);
         const singleDigitSelectors = sparseSelectors.every(sel => sel < 512);
         const quotes = [...quotesSeen].sort((a, b) => a - b);
         const quoteStart = quotes.length === 0 ? '' :
@@ -1308,7 +1334,7 @@ export class Packer {
         };
 
         // only keep two significant digits, rounding up
-        const [contextMant, contextExp] = approximateWithTwoSigDigits(numModels << contextBits);
+        const [contextMant, contextExp] = approximateWithTwoSigDigits(numModels * 2 ** contextBits);
         const contextSize = `${contextMant}e${contextExp}`;
 
         // 0. first line
@@ -1362,7 +1388,7 @@ export class Packer {
             // λ: write position in ο
             // χ: if in string the quote character code, otherwise 0 (same to state.quote)
             // we know the exact input length, so we don't have the end of data symbol
-            `for(${options.allowFreeVars ? `ο=[τ=ρ=λ=${quotes.length > 0 ? 'χ=' : ''}0]` : ''};` +
+            `for(${options.allowFreeVars ? `ο=[${options.sse ? 'w=' : ''}τ=ρ=λ=${quotes.length > 0 ? 'χ=' : ''}0]` : options.sse ? 'w=0' : ''};` +
 
                 // 2. read until the known length
                 `λ<${inputLength};` +
@@ -1380,10 +1406,12 @@ export class Packer {
                     // (we only process quotes that actually have appeared in the input)
                     quoteStart
             :
-                // same as above but don't need to keep ν
-                `ο[λ++]=ν-${1 << inBits}`
+                // SSE keeps the decoded byte in ν for the word hash.
+                `ο[λ++]=ν-${options.sse ? '=' : ''}${1 << inBits}`
             ) +
 
+            // The 'w' selector reads ο[λ-'w'] (ο.NaN), reusing the hash loop.
+            (options.sse ? ',w=ο.NaN=ν>64&&ν<123?w*997+ν|0:0' : '') +
             `)` +
 
             // 3. bitwise read loop
@@ -1403,7 +1431,7 @@ export class Packer {
                     `α=Math.log(α/(θ-α)),` +
 
                     `Σ-=(` +
-                        `ω[τ]+` +
+                        `ω[τ]+${options.sse ? String(SSE_WEIGHT_BIAS).replace(/^0\./, '.') + '+' : ''}` +
                         `ω[${byteWeightIndex}]+` +
                         `ω[${pairWeightIndex}]+` +
                         `ω[${prefixWeightIndex}]` +
@@ -1456,7 +1484,7 @@ export class Packer {
                 (singleDigitSelectors ?
                     `φ='${selectors.map(i => i.join('')).join('0')}'.split(Σ=0)`
                 :
-                    `Σ=0,φ=${JSON.stringify(selectors)}`
+                    `Σ=0,φ=${JSON.stringify(selectors).replace(/"w"/g, "'w'")}`
                 ) + `.map((δ,τ)=>` +
                     // δ: an array of context offsets (1: last byte, 2: second-to-last byte, ...)
                     // τ: model index
@@ -1529,15 +1557,12 @@ export class Packer {
             // remaining variables can be in any order
             [...'Σαβδεθκλμνοπρτφχω']
                 .filter(v => secondLineInit.every(([w]) => v !== w)).join('');
+        // SSE names are tuned for the compressed decoder.
         const actualNames =
-            // should use letters from existing names that we can't remove,
-            // so that we can keep the Huffman tree small
-            'M' + // from `Math`
-            'charCodeAt' +
-            'Uiny' + // from `Uint##Array`, the best possible without any further duplicate
-            'xp' + // from `exp`
-            (quotes.length > 0 ? 'f' : '') + // from `for`
-            (options.sse ? 'l' : ''); // second SSE index
+            (options.sse ? 'g' : 'M') +
+            (options.sse ? 'charCodeMt' : 'charCodeAt') +
+            'Uiny' + 'xp' + (quotes.length > 0 ? 'f' : '') +
+            (options.sse ? 'lw' : '');
 
         if (options.allowFreeVars) {
             firstLine += ';';
@@ -1571,7 +1596,7 @@ export class Packer {
                 .filter(([v, name]) => name && !boundVars.includes(v) &&
                     (v !== 'χ' || quotes.length > 0))
                 .map(([, name]) => name),
-            ...(options.sse ? ['l'] : []),
+            ...(options.sse ? ['l', 'w'] : []),
         ])].sort() : [];
 
         return {
@@ -1660,7 +1685,6 @@ export class Packer {
                 options.pairRecipLearningRate,
                 options.contextBits,
                 options.maxMemoryMB,
-                options.useUint16Counts,
                 options.sse,
                 options.optimizePrefix,
                 options.optimizeSuffix,

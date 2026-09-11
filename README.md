@@ -105,7 +105,7 @@ Each input can be further configured by input type and action. In the CLI you pu
 
 **Number of contexts** (CLI `-S|--selectors xCOUNT`) relates to the complexity of modelling. The larger number of contexts will compress better, but at the expense of linear increase in both the time and memory usage. The default is 12, which targets at most 1 second of latency permitted for typical 30 KB input.
 
-**Maximum memory usage** (CLI `-M|--max-memory MEGABYTES`, API `maxMemoryMB` in the options object) configures the maximum memory to be used for decompression. Increasing or decreasing memory usage mostly affects the compression ratio and not the run time. The default is 150 MB and a larger value is not recommended for various reasons:
+**Maximum memory usage** (CLI `-M|--max-memory MEGABYTES`, API `maxMemoryMB` in the options object) configures the primary context-table budget in decimal megabytes (1 MB = 1,000,000 bytes), including the extra word model when SSE is enabled. Auxiliary mixer weights are additional. Increasing or decreasing memory usage mostly affects the compression ratio and not the run time. The default is 150 MB and a larger value is not recommended for various reasons:
 
 * Any further gain for larger memory use is negligible for typical inputs less than 100 KB.
 
@@ -143,14 +143,12 @@ The actual memory usage can be as low as a half of the specified due to the inte
 
 The optimizer also searches the ordinary and pair learning rates together, keeping `recipLearningRate / pairRecipLearningRate` at integer factors 1 through 6 (plus the current integer factor, if within the search bounds). These ratios produce short multipliers in the generated decoder. Level 1 samples a few scales for each factor; higher levels refine each scale locally. Independent rate searches then allow non-integer ratios to win when they produce a better score. The existing rate options retain their meanings.
 
-**Secondary symbol estimation** (CLI `--sse`, API `sse: true`, default `false`) adds a compact correction to the mixed prediction in logit space. It uses eight wrapping buckets with no interpolation, trained by the current byte prefix and previous byte. SSE shares a padded mixer weights array and increases decoder size and auxiliary memory; measure the final archive to decide whether it helps. The context-table memory estimate does not include these auxiliary mixer weights. SSE uses the JavaScript encoder rather than the existing WASM runner and stays fixed during parameter search. Reported CLI parameters retain `--sse` so they reproduce the selected mode.
-
-**16-bit count tables** (CLI `-Zuc|--uint16-counts`, API `useUint16Counts`, default `false`) use `Uint16Array` where the generated decoder would normally use `Uint8Array`. This can reduce compressed decoder size, at the cost of more table memory and initialization work. Memory budgeting accounts for the wider table. Larger count tables are unchanged, and this flag does not disable default optimization.
+**Secondary symbol estimation** (CLI `--sse`, API `sse: true`, default `false`) adds a compact correction to the mixed prediction in logit space. It uses eight wrapping buckets with no interpolation, trained by the current byte prefix and previous byte. SSE also adds a rolling word-context model (bytes 65–122), a `.1` mixer bias, and a tuned terminal-state offset for 6-bit rANS output. Count tables automatically use the narrowest safe array. SSE shares a padded mixer weights array and increases decoder size and auxiliary memory; measure the final archive to decide whether it helps. The context-table memory estimate does not include these auxiliary mixer weights. SSE uses the JavaScript encoder rather than the existing WASM runner and stays fixed during parameter search. Reported CLI parameters retain `--sse` so they reproduce the selected mode.
 
 **Optimization wrappers** (CLI `--optimize-wrapper FILE`, API `optimizePrefix` and `optimizeSuffix`) supply the surrounding content when scoring a candidate. The wrapper file must contain exactly one `__ROADROLLER__` marker, for example `<script>__ROADROLLER__</script>`. The CLI currently requires `--zopfli` for this option:
 
 ```sh
-roadroller --zopfli --optimize-wrapper page-wrapper.html -Zuc -O1 input.js -o packed.js
+roadroller --zopfli --optimize-wrapper page-wrapper.html -O1 input.js -o packed.js
 ```
 
 The optional `node-zopfli-es` dependency is loaded by the CLI only when `--zopfli` is requested.
