@@ -444,9 +444,171 @@ export class LogisticMixModel {
     }
 }
 
+export class ContextualLogisticMixModel extends LogisticMixModel {
+    constructor(models, options) {
+        super(models, options);
+
+        const {
+            inBits,
+            pairRecipLearningRate = 400,
+        } = options;
+
+        this.pairRecipLearningRate = pairRecipLearningRate;
+
+        const numModels = models.length;
+        const alphabetSize = 1 << inBits;
+
+        this.numModels = numModels;
+        this.alphabetSize = alphabetSize;
+
+        // Layout of this.weights:
+        //
+        // global:
+        //   1 * numModels
+        //
+        // previous byte:
+        //   alphabetSize * numModels
+        //
+        // previous two bytes:
+        //   alphabetSize² * numModels
+        //
+        // current partial-byte prefix:
+        //   alphabetSize * numModels
+
+        this.byteWeightOffset = numModels;
+
+        this.pairWeightOffset =
+            numModels * (1 + alphabetSize);
+
+        this.prefixWeightOffset =
+            numModels * (
+                1 +
+                alphabetSize +
+                alphabetSize * alphabetSize
+            );
+
+        const weightCount =
+            numModels * (
+                1 +
+                2 * alphabetSize +
+                alphabetSize * alphabetSize
+            );
+
+        this.weights = new Float64Array(weightCount);
+
+        this.previousByte = 0;
+        this.previousByte2 = 0;
+        this.bitContext = 1;
+
+        // Cached by predict(), then reused by update().
+        this.byteWeightBase = 0;
+        this.pairWeightBase = 0;
+        this.prefixWeightBase = 0;
+    }
+
+    predict(context = 0) {
+        const numModels = this.numModels;
+
+        this.byteWeightBase =
+            this.byteWeightOffset +
+            this.previousByte * numModels;
+
+        this.pairWeightBase =
+            this.pairWeightOffset +
+            (
+                this.previousByte * this.alphabetSize +
+                this.previousByte2
+            ) * numModels;
+
+        this.prefixWeightBase =
+            this.prefixWeightOffset +
+            this.bitContext * numModels;
+
+        let total = 0;
+
+        for (let i = 0; i < numModels; ++i) {
+            const prob =
+                this.models[i].predict(context) * 2 + 1;
+
+            const stretchedProb =
+                Math.log(
+                    prob /
+                    ((2 << this.precision) - prob)
+                );
+
+            this.stretchedProbs[i] = stretchedProb;
+
+            const weight =
+                this.weights[i] +
+                this.weights[this.byteWeightBase + i] +
+                this.weights[this.pairWeightBase + i] +
+                this.weights[this.prefixWeightBase + i];
+
+            total += weight * stretchedProb;
+        }
+
+        const mixedProb =
+            ((2 << this.precision) - 1) /
+            (1 + Math.exp(-total));
+
+        this.mixedProb = mixedProb | 1;
+
+        return this.mixedProb >> 1;
+    }
+
+    update(actualBit, context = 0) {
+        const mixedProb =
+            this.mixedProb / (2 << this.precision);
+
+        const error = actualBit - mixedProb;
+
+        for (let i = 0; i < this.numModels; ++i) {
+            this.models[i].update(actualBit, context);
+
+            const stretchedProb =
+                this.stretchedProbs[i];
+
+            const commonDelta =
+                stretchedProb /
+                this.recipLearningRate *
+                error;
+
+            const pairDelta =
+                stretchedProb /
+                this.pairRecipLearningRate *
+                error;
+
+            this.weights[i] += commonDelta;
+
+            this.weights[
+                this.byteWeightBase + i
+            ] += commonDelta;
+
+            this.weights[
+                this.pairWeightBase + i
+            ] += pairDelta;
+
+            this.weights[
+                this.prefixWeightBase + i
+            ] += commonDelta;
+        }
+
+        this.bitContext =
+            (this.bitContext << 1) | actualBit;
+    }
+
+    flushByte(currentByte, inBits) {
+        super.flushByte(currentByte, inBits);
+
+        this.previousByte2 = this.previousByte;
+        this.previousByte = currentByte;
+        this.bitContext = 1;
+    }
+}
+
 //------------------------------------------------------------------------------
 
-export class DefaultModel extends LogisticMixModel {
+export class DefaultModel extends ContextualLogisticMixModel {
     constructor(options) {
         const { inBits, sparseSelectors, modelQuotes } = options;
         const models = sparseSelectors.map(sparseSelector => {
@@ -692,6 +854,7 @@ export class Packer {
             modelMaxCount: options.modelMaxCount || 5,
             modelRecipBaseCount: options.modelRecipBaseCount || 20,
             recipLearningRate: options.recipLearningRate || Math.max(1, 500),
+            pairRecipLearningRate: options.pairRecipLearningRate || 400,
             contextBits: options.contextBits,
             resourcePool: options.resourcePool || options.arrayBufferPool || new ResourcePool(),
             numAbbreviations: typeof options.numAbbreviations === 'number' ? options.numAbbreviations : 64,
@@ -962,15 +1125,65 @@ export class Packer {
         const modelQuotes = !!(options.dynamicModels & DYN_MODEL_QUOTES);
 
         const {
-            sparseSelectors, precision, modelMaxCount, modelRecipBaseCount,
-            recipLearningRate, allowFreeVars,
+            sparseSelectors,
+            precision,
+            modelMaxCount,
+            modelRecipBaseCount,
+            recipLearningRate,
+            pairRecipLearningRate,
+            allowFreeVars,
         } = options;
+
         const contextBits = options.contextBits || contextBitsFromMaxMemory(options);
 
-        const compressOptions = { ...options, inBits, outBits, modelQuotes, contextBits };
+        const compressOptions = {
+            ...options,
+            inBits,
+            outBits,
+            modelQuotes,
+            contextBits,
+            disableWasm: true,
+        };
         const { buf, state, inputLength, bufLengthInBytes, quotesSeen } = compressWithDefaultModel(combinedInput, compressOptions);
 
         const numModels = sparseSelectors.length;
+
+        const mixerAlphabetSize = 1 << inBits;
+
+        const mixerByteOffset = numModels;
+
+        const mixerPairOffset = numModels * (
+            1 +
+            mixerAlphabetSize
+        );
+
+        const mixerPrefixOffset = numModels * (
+            1 +
+            mixerAlphabetSize +
+            mixerAlphabetSize * mixerAlphabetSize
+        );
+
+        const mixerWeightCount = numModels * (
+            1 +
+            2 * mixerAlphabetSize +
+            mixerAlphabetSize * mixerAlphabetSize
+        );
+
+        const pairLearningFactor =
+            recipLearningRate /
+            pairRecipLearningRate;
+
+        const byteWeightIndex =
+            `(ο[λ-1]||0)*${numModels}+μ+${mixerByteOffset}`;
+
+        const pairWeightIndex =
+            `((ο[λ-1]||0)*${mixerAlphabetSize}` +
+            `+(ο[λ-2]||0))*${numModels}` +
+            `+μ+${mixerPairOffset}`;
+
+        const prefixWeightIndex =
+            `ν*${numModels}+μ+${mixerPrefixOffset}`;
+
         const predictionBits = 8 * predictionBytesPerContext(compressOptions);
         const countBits = 8 * countBytesPerContext(compressOptions);
 
@@ -1090,7 +1303,7 @@ export class Packer {
         // κ: counts
         const secondLineInit = [
             [`θ`, `1<<${precision + 1}`],
-            [`ω`, `${JSON.stringify(Array(numModels).fill(0))}`],
+            [`ω`, `Array(${mixerWeightCount}).fill(0)`],
             [`π`, `new Uint${predictionBits}Array(${contextSize}).fill(1<<${precision - 1})`],
             [`κ`, `new Uint${countBits}Array(${contextSize})`],
         ];
@@ -1154,10 +1367,15 @@ export class Packer {
                 // ε: stretched probabilities later used by prediction adjustment
                 `ε=φ.map((δ,μ)=>(` +
                     `α=π[δ]*2+1,` +
-                    // stretch(prob), needed for updates
                     `α=Math.log(α/(θ-α)),` +
-                    `Σ-=ω[μ]*α,` +
-                    // premultiply with learning rate
+
+                    `Σ-=(` +
+                        `ω[μ]+` +
+                        `ω[${byteWeightIndex}]+` +
+                        `ω[${pairWeightIndex}]+` +
+                        `ω[${prefixWeightIndex}]` +
+                    `)*α,` +
+
                     `α/${recipLearningRate}` +
                 `)),` +
 
@@ -1185,7 +1403,11 @@ export class Packer {
                         // we've already verified delta is within +/-2^31, so `>>>` is not required
                         `>>${29 - precision},` +
                     // update the weight
-                    `ω[μ]+=ε[μ]*(β-Σ/θ)` +
+                    `α=ε[μ]*(β-Σ/θ),` +
+                    `ω[μ]+=α,` +
+                    `ω[${byteWeightIndex}]+=α,` +
+                    `ω[${pairWeightIndex}]+=α*${pairLearningFactor},` +
+                    `ω[${prefixWeightIndex}]+=α` +
                 `)),` +
                 `ν=ν*2+β` +
 
