@@ -38,12 +38,8 @@ class AdaptiveZopfliScore {
     }
 
     /*
-     * Used whenever Roadroller treats the score like a normal number,
-     * e.g. simulated annealing:
-     *
-     *     currentSize - nextSize
-     *
-     * Those operations should stay cheap and use Zopfli-1 only.
+     * Numeric reporting stays cheap and uses Zopfli-1 only.
+     * Global-best selection and annealing acceptance use compare() instead.
      */
     valueOf() {
         return this.sizeAt(1);

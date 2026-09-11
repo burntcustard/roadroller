@@ -202,6 +202,7 @@ export interface PackerOptions {
     /** Receives prefix + firstLine + secondLine + suffix. */
     optimizeScore?: (input: string, packed: Packed, options: PackerOptions) => number | {
         valueOf(): number;
+        /** Signed size difference; also used for annealing acceptance probability. */
         compare(other: any): number;
         cachedSizeAt?(iterations: number): number | undefined;
     };

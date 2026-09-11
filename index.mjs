@@ -1865,8 +1865,11 @@ export class Packer {
             next.sort((a, b) => a - b);
 
             const { size: nextSize, bestUpdated } = updateBest({ ...best, sparseSelectors: next });
-            // if nextSize > currentSize then accept by some probability exp(delta / kT) < 1
-            const rejected = Math.exp((currentSize - nextSize) / (6 * temperature)) < Math.random();
+            // Use the same adaptive comparison as global-best selection,
+            // reusing cached compression results for close candidates.
+            const delta = compareSizes(nextSize, currentSize);
+            // Better/equal moves are always accepted; worse moves are probabilistic.
+            const rejected = delta > 0 && Math.exp(-delta / (6 * temperature)) < Math.random();
             await reportProgress(
                 'sparseSelectors', Math.log(temperature) / Math.log(targetTemperature),
                 { ...best, sparseSelectors: next }, nextSize,
