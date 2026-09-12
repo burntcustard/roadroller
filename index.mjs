@@ -610,12 +610,10 @@ export class ContextualLogisticMixModel extends LogisticMixModel {
                 this.recipLearningRate *
                 error;
 
-            // SSE must reproduce the generated decoder's floating-point order.
-            const pairDelta = this.sse ?
-                commonDelta * (this.recipLearningRate / this.pairRecipLearningRate) :
-                stretchedProb /
-                this.pairRecipLearningRate *
-                error;
+            // Match the generated decoder's floating-point order for
+            // both the SSE and non-SSE contextual logistic mixers
+            const pairDelta =
+                commonDelta * (this.recipLearningRate / this.pairRecipLearningRate);
 
             this.weights[i] += commonDelta;
 
