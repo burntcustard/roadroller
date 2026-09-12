@@ -408,7 +408,7 @@ async function compress({ inputs, options, optimize, useZopfli, outputPath, verb
                 JSON.stringify(defaultSparseSelectors(options.sparseSelectors.length)) :
                 ''; // more than 13 selectors are randomly determined
 
-        const format = moreOptions => {
+        const format = (moreOptions, includeStatic = false) => {
             const combined = { ...packer.options, ...moreOptions };
             let args;
             if (!combined.sparseSelectors) {
@@ -421,7 +421,8 @@ async function compress({ inputs, options, optimize, useZopfli, outputPath, verb
             if (typeof combined.precision === 'number') {
                 args = `-Zpr${combined.precision} ${args}`;
             }
-            if (combined.sse) {
+            // sse never changes during the search, only show it in the final replicate command
+            if (includeStatic && combined.sse) {
                 args = `--sse ${args}`;
             }
             if (typeof combined.modelRecipBaseCount === 'number') {
@@ -496,7 +497,7 @@ async function compress({ inputs, options, optimize, useZopfli, outputPath, verb
             const ratio = origLength > 0 ? 100 - result.bestSize / origLength * 100 : -Infinity;
             console.warn(
                 (stop ? 'search aborted after' : 'search done in') +
-                ` ${(elapsedMsecs / 1000).toFixed(1)}s, use \`${format(result.best)}\` to replicate:`,
+                ` ${(elapsedMsecs / 1000).toFixed(1)}s, use \`${format(result.best, true)}\` to replicate:`,
                 result.bestSize,
                 `(estimated, ${Math.abs(ratio).toFixed(2)}% ${ratio > 0 ? 'smaller' : 'larger'})`);
         }
