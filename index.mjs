@@ -122,7 +122,8 @@ const ANS_BITS = 28;
 
 // roughly based on https://github.com/rygorous/ryg_rans/blob/master/rans_byte.h
 export class AnsEncoder {
-    constructor({ outBits, precision }) {
+    constructor({ outBits, precision, sse = false }) {
+        this.initialStateOffset = sse && outBits === 6 ? SSE_ANS_TERMINAL_OFFSET : 0;
         // all input frequencies are assumed to be scaled by 2^precision
         this.precision = precision;
 
@@ -160,7 +161,7 @@ export class AnsEncoder {
 
         const outSymbols = this.outBits < 0 ? -this.outBits : 1 << this.outBits;
 
-        let state = 1 << (ANS_BITS - ceilLog2(outSymbols));
+        let state = (1 << (ANS_BITS - ceilLog2(outSymbols))) + this.initialStateOffset;
 
         const buf = [];
         const probScale = this.precision + 1;
@@ -386,6 +387,27 @@ export class SparseContextModel extends DirectContextModel {
     }
 }
 
+// Rolling word context, enabled as an extra default model with SSE.
+export class WordContextModel extends DirectContextModel {
+    constructor(options) {
+        super(options);
+        this.word = 0;
+        this.sparseContext = 0;
+    }
+    predict(context = 0) {
+        return super.predict(this.sparseContext + context);
+    }
+    update(actualBit, context = 0) {
+        super.update(actualBit, this.sparseContext + context);
+    }
+    flushByte(currentByte, inBits) {
+        super.flushByte(currentByte, inBits);
+        this.word = currentByte > 64 && currentByte < 123
+            ? (this.word * 997 + currentByte) | 0 : 0;
+        this.sparseContext = this.word * 997 | 0;
+    }
+}
+
 export class LogisticMixModel {
     constructor(models, { recipLearningRate, precision }) {
         this.models = models;
@@ -444,14 +466,197 @@ export class LogisticMixModel {
     }
 }
 
+// Compact, opt-in secondary symbol estimation, shared by encoder and decoder.
+const SSE_WEIGHT_BIAS = 0.1;
+const SSE_ANS_TERMINAL_OFFSET = 917503;
+const numDefaultModels = options => options.sparseSelectors.length + (options.sse ? 1 : 0);
+const SSE_BINS = 8;
+const SSE_PREFIX_STRIDE = 6;
+const SSE_LOGIT_DIVISOR = 3;
+const SSE_RECIP_LEARNING_RATE = 32;
+const SSE_BYTE_LEARNING_FACTOR = 2;
+
+const contextualMixerLayout = (numModels, alphabetSize, sse) => {
+    const byteOffset = numModels;
+    let pairOffset = numModels * (1 + alphabetSize);
+    let prefixOffset = pairOffset + numModels * alphabetSize * alphabetSize;
+    let weightCount = prefixOffset + numModels * alphabetSize;
+    let sseOffset = 0;
+    let sseRowStride = 0;
+    if (sse) {
+        const nextPowerOfTwo = n => 2 ** Math.ceil(Math.log2(Math.max(1, n)));
+        pairOffset = nextPowerOfTwo(pairOffset);
+        prefixOffset = nextPowerOfTwo(pairOffset + numModels * alphabetSize * alphabetSize);
+        const prefixEnd = prefixOffset + numModels * alphabetSize;
+        sseOffset = Math.ceil(prefixEnd / 65536) * 65536;
+        sseRowStride = alphabetSize * SSE_BINS;
+        const required = sseOffset + alphabetSize * sseRowStride +
+            (alphabetSize - 1) * SSE_PREFIX_STRIDE + SSE_BINS;
+        weightCount = Math.max(600000, Math.ceil(required / 100000) * 100000);
+    }
+    return { byteOffset, pairOffset, prefixOffset, weightCount, sseOffset, sseRowStride };
+};
+
+export class ContextualLogisticMixModel extends LogisticMixModel {
+    constructor(models, options) {
+        super(models, options);
+
+        const {
+            inBits,
+            pairRecipLearningRate = 400,
+        } = options;
+
+        this.pairRecipLearningRate = pairRecipLearningRate;
+
+        const numModels = models.length;
+        const alphabetSize = 1 << inBits;
+
+        this.numModels = numModels;
+        this.alphabetSize = alphabetSize;
+
+        // Global, byte, pair and prefix mixer weights, then optional SSE rows.
+        this.sse = !!options.sse;
+        const layout = contextualMixerLayout(numModels, alphabetSize, this.sse);
+        this.byteWeightOffset = layout.byteOffset;
+        this.pairWeightOffset = layout.pairOffset;
+        this.prefixWeightOffset = layout.prefixOffset;
+        this.sseWeightOffset = layout.sseOffset;
+        this.sseRowStride = layout.sseRowStride;
+        this.weights = new Float64Array(layout.weightCount);
+        this.sseIndex = 0;
+        this.sseByteIndex = 0;
+
+        this.previousByte = 0;
+        this.previousByte2 = 0;
+        this.bitContext = 1;
+
+        // Cached by predict(), then reused by update().
+        this.byteWeightBase = 0;
+        this.pairWeightBase = 0;
+        this.prefixWeightBase = 0;
+    }
+
+    predict(context = 0) {
+        const numModels = this.numModels;
+
+        this.byteWeightBase =
+            this.byteWeightOffset +
+            this.previousByte * numModels;
+
+        this.pairWeightBase =
+            this.pairWeightOffset +
+            (
+                this.previousByte * this.alphabetSize +
+                this.previousByte2
+            ) * numModels;
+
+        this.prefixWeightBase =
+            this.prefixWeightOffset +
+            this.bitContext * numModels;
+
+        let total = 0;
+
+        for (let i = 0; i < numModels; ++i) {
+            const prob =
+                this.models[i].predict(context) * 2 + 1;
+
+            const stretchedProb =
+                Math.log(
+                    prob /
+                    ((2 << this.precision) - prob)
+                );
+
+            this.stretchedProbs[i] = stretchedProb;
+
+            const weight =
+                this.weights[i] +
+                (this.sse ? SSE_WEIGHT_BIAS : 0) +
+                this.weights[this.byteWeightBase + i] +
+                this.weights[this.pairWeightBase + i] +
+                this.weights[this.prefixWeightBase + i];
+
+            total += weight * stretchedProb;
+        }
+
+        let logit = -total;
+        if (this.sse) {
+            // Intentionally wrap eight hard buckets; no clamping or interpolation.
+            this.sseIndex = this.sseWeightOffset + SSE_PREFIX_STRIDE * this.bitContext +
+                ((logit / SSE_LOGIT_DIVISOR + SSE_BINS / 2) & (SSE_BINS - 1));
+            this.sseByteIndex = this.sseIndex + (this.previousByte + 1) * this.sseRowStride;
+            logit -= this.weights[this.sseIndex] + this.weights[this.sseByteIndex];
+        }
+        const mixedProb = ((2 << this.precision) - 1) / (1 + Math.exp(logit));
+
+        this.mixedProb = mixedProb | 1;
+
+        return this.mixedProb >> 1;
+    }
+
+    update(actualBit, context = 0) {
+        const mixedProb =
+            this.mixedProb / (2 << this.precision);
+
+        const error = actualBit - mixedProb;
+
+        for (let i = 0; i < this.numModels; ++i) {
+            this.models[i].update(actualBit, context);
+
+            const stretchedProb =
+                this.stretchedProbs[i];
+
+            const commonDelta =
+                stretchedProb /
+                this.recipLearningRate *
+                error;
+
+            // Match the generated decoder's floating-point order for
+            // both the SSE and non-SSE contextual logistic mixers
+            const pairDelta =
+                commonDelta * (this.recipLearningRate / this.pairRecipLearningRate);
+
+            this.weights[i] += commonDelta;
+
+            this.weights[
+                this.byteWeightBase + i
+            ] += commonDelta;
+
+            this.weights[
+                this.pairWeightBase + i
+            ] += pairDelta;
+
+            this.weights[
+                this.prefixWeightBase + i
+            ] += commonDelta;
+        }
+
+        if (this.sse) {
+            const delta = error / SSE_RECIP_LEARNING_RATE;
+            this.weights[this.sseIndex] += delta;
+            this.weights[this.sseByteIndex] += delta * SSE_BYTE_LEARNING_FACTOR;
+        }
+        this.bitContext =
+            (this.bitContext << 1) | actualBit;
+    }
+
+    flushByte(currentByte, inBits) {
+        super.flushByte(currentByte, inBits);
+
+        this.previousByte2 = this.previousByte;
+        this.previousByte = currentByte;
+        this.bitContext = 1;
+    }
+}
+
 //------------------------------------------------------------------------------
 
-export class DefaultModel extends LogisticMixModel {
+export class DefaultModel extends ContextualLogisticMixModel {
     constructor(options) {
         const { inBits, sparseSelectors, modelQuotes } = options;
         const models = sparseSelectors.map(sparseSelector => {
             return new SparseContextModel({ ...options, sparseSelector });
         });
+        if (options.sse) models.push(new WordContextModel(options));
         super(models, options);
 
         this.modelQuotes = modelQuotes;
@@ -554,6 +759,7 @@ export const compressWithDefaultModel = (input, options) => {
         resourcePool &&
         (options.preset || []).length === 0 &&
         !options.disableWasm &&
+        !options.sse &&
         !options.calculateByteEntropy &&
         options.sparseSelectors.length <= 64 &&
         options.sparseSelectors.every(sel => sel < 0x8000)
@@ -667,12 +873,12 @@ const countBytesPerContext = options => (options.modelMaxCount < 128 ? 1 : optio
 
 const contextBitsFromMaxMemory = options => {
     const bytesPerContext = predictionBytesPerContext(options) + countBytesPerContext(options);
-    let contextBits = floorLog2(options.maxMemoryMB * 1048576, options.sparseSelectors.length * bytesPerContext);
+    let contextBits = floorLog2(options.maxMemoryMB * 1000 * 1000, numDefaultModels(options) * bytesPerContext);
 
     // the decoder slightly overallocates the memory (~1%) so a naive calculation can exceed the memory limit;
     // recalculate the actual memory usage and decrease contextBits in that case.
-    const [, , actualNumContexts] = approximateWithTwoSigDigits(options.sparseSelectors.length << contextBits);
-    if (actualNumContexts * bytesPerContext > options.maxMemoryMB * 1048576) --contextBits;
+    const [, , actualNumContexts] = approximateWithTwoSigDigits(numDefaultModels(options) * 2 ** contextBits);
+    if (actualNumContexts * bytesPerContext > options.maxMemoryMB * 1000 * 1000) --contextBits;
 
     return contextBits;
 };
@@ -685,19 +891,27 @@ const DYN_MODEL_QUOTES = 1;
 
 export class Packer {
     constructor(inputs, options = {}) {
+        if (options.sse !== undefined && typeof options.sse !== 'boolean') {
+            throw new Error('Packer: sse must be a boolean');
+        }
         this.options = {
             sparseSelectors: options.sparseSelectors ? options.sparseSelectors.slice() : defaultSparseSelectors(),
-            maxMemoryMB: options.maxMemoryMB || 150,
+            maxMemoryMB: options.maxMemoryMB || 500,
             precision: options.precision || 16,
             modelMaxCount: options.modelMaxCount || 5,
             modelRecipBaseCount: options.modelRecipBaseCount || 20,
             recipLearningRate: options.recipLearningRate || Math.max(1, 500),
+            pairRecipLearningRate: options.pairRecipLearningRate || 500,
             contextBits: options.contextBits,
             resourcePool: options.resourcePool || options.arrayBufferPool || new ResourcePool(),
             numAbbreviations: typeof options.numAbbreviations === 'number' ? options.numAbbreviations : 64,
             dynamicModels: options.dynamicModels,
             allowFreeVars: options.allowFreeVars,
             disableWasm: options.disableWasm,
+            sse: !!options.sse,
+            optimizePrefix: options.optimizePrefix || '',
+            optimizeSuffix: options.optimizeSuffix || '',
+            optimizeScore: options.optimizeScore,
         };
 
         this.inputsByType = {};
@@ -744,10 +958,10 @@ export class Packer {
     }
 
     get memoryUsageMB() {
-        const contextBits = this.options.contextBits || contextBitsFromMaxMemory(this.options);
-        const [, , numContexts] = approximateWithTwoSigDigits(this.options.sparseSelectors.length << contextBits);
+        const contextBits = this.options.contextBits ?? contextBitsFromMaxMemory(this.options);
+        const [, , numContexts] = approximateWithTwoSigDigits(numDefaultModels(this.options) * 2 ** contextBits);
         const bytesPerContext = predictionBytesPerContext(this.options) + countBytesPerContext(this.options);
-        return numContexts * bytesPerContext / 1048576;
+        return numContexts * bytesPerContext / (1000 * 1000);
     }
 
     static prepareText(inputs) {
@@ -962,15 +1176,67 @@ export class Packer {
         const modelQuotes = !!(options.dynamicModels & DYN_MODEL_QUOTES);
 
         const {
-            sparseSelectors, precision, modelMaxCount, modelRecipBaseCount,
-            recipLearningRate, allowFreeVars,
+            sparseSelectors,
+            precision,
+            modelMaxCount,
+            modelRecipBaseCount,
+            recipLearningRate,
+            pairRecipLearningRate,
+            allowFreeVars,
         } = options;
-        const contextBits = options.contextBits || contextBitsFromMaxMemory(options);
 
-        const compressOptions = { ...options, inBits, outBits, modelQuotes, contextBits };
+        const contextBits = options.contextBits ?? contextBitsFromMaxMemory(options);
+
+        const compressOptions = {
+            ...options,
+            inBits,
+            outBits,
+            modelQuotes,
+            contextBits,
+            disableWasm: true,
+        };
         const { buf, state, inputLength, bufLengthInBytes, quotesSeen } = compressWithDefaultModel(combinedInput, compressOptions);
 
-        const numModels = sparseSelectors.length;
+        const numModels = numDefaultModels(options);
+
+        const mixerAlphabetSize = 1 << inBits;
+
+        const mixerLayout = contextualMixerLayout(numModels, mixerAlphabetSize, options.sse);
+        const mixerByteOffset = mixerLayout.byteOffset;
+        const mixerPairOffset = mixerLayout.pairOffset;
+        const compactOffset = offset => {
+            const factor = offset / (2 << precision);
+            return options.sse && Number.isInteger(factor) && factor >= 1 && factor <= 9
+                ? (factor === 1 ? 'θ' : `${factor}*θ`) : `${offset}`;
+        };
+        const mixerPrefixOffset = compactOffset(mixerLayout.prefixOffset);
+        const mixerWeightCount = options.sse
+            ? String(mixerLayout.weightCount).replace(/0{3,}$/, zeros => `e${zeros.length}`)
+            : mixerLayout.weightCount;
+        const ssePredict = options.sse ?
+            `δ=${compactOffset(mixerLayout.sseOffset)}+${SSE_PREFIX_STRIDE}*ν+` +
+                `(Σ/${SSE_LOGIT_DIVISOR}+${SSE_BINS / 2}&${SSE_BINS - 1}),` +
+            `l=δ+((ο[λ-1]||0)+1<<${inBits + 3}),` +
+            `Σ-=ω[δ]+ω[l],` : '';
+        const sseUpdate = options.sse ?
+            `ω[δ]+=α=(β-Σ/θ)/${SSE_RECIP_LEARNING_RATE},` +
+            `ω[l]+=α*${SSE_BYTE_LEARNING_FACTOR},` : '';
+
+        const pairLearningFactor =
+            recipLearningRate /
+            pairRecipLearningRate;
+
+        const byteWeightIndex =
+            `(ο[λ-1]||0)*${numModels}+τ+${mixerByteOffset}`;
+
+        const pairWeightIndex =
+            `((ο[λ-1]||0)*${mixerAlphabetSize}` +
+            `+(ο[λ-2]||0))*${numModels}` +
+            `+τ+${mixerPairOffset}`;
+
+        const prefixWeightIndex =
+            `ν*${numModels}+τ+${mixerPrefixOffset}`;
+
         const predictionBits = 8 * predictionBytesPerContext(compressOptions);
         const countBits = 8 * countBytesPerContext(compressOptions);
 
@@ -982,8 +1248,14 @@ export class Packer {
             }
             selectors.push(bits.reverse());
         }
+        if (options.sse) selectors.push(['w']);
         const singleDigitSelectors = sparseSelectors.every(sel => sel < 512);
         const quotes = [...quotesSeen].sort((a, b) => a - b);
+        const quoteStart = quotes.length === 0 ? '' :
+            quotes.length === 1 ? `ν==${quotes[0]}&&ν` :
+            inBits === 7 && quotes.length === 2 && quotes[0] === 34 && quotes[1] === 96
+                ? `ν%62==34&&ν`
+                : `(${quotes.map(q => `ν==${q}`).join('|')})&&ν`;
 
         // 2+ decimal points doesn't seem to make any difference after DEFLATE
         const modelBaseCount = { 1: '1', 2: '.5', 5: '.2', 10: '.1' }[modelRecipBaseCount] || `1/${modelRecipBaseCount}`;
@@ -1060,7 +1332,7 @@ export class Packer {
         };
 
         // only keep two significant digits, rounding up
-        const [contextMant, contextExp] = approximateWithTwoSigDigits(numModels << contextBits);
+        const [contextMant, contextExp] = approximateWithTwoSigDigits(numModels * 2 ** contextBits);
         const contextSize = `${contextMant}e${contextExp}`;
 
         // 0. first line
@@ -1090,7 +1362,7 @@ export class Packer {
         // κ: counts
         const secondLineInit = [
             [`θ`, `1<<${precision + 1}`],
-            [`ω`, `${JSON.stringify(Array(numModels).fill(0))}`],
+            [`ω`, `Array(${mixerWeightCount}).fill(0)`],
             [`π`, `new Uint${predictionBits}Array(${contextSize}).fill(1<<${precision - 1})`],
             [`κ`, `new Uint${countBits}Array(${contextSize})`],
         ];
@@ -1114,7 +1386,7 @@ export class Packer {
             // λ: write position in ο
             // χ: if in string the quote character code, otherwise 0 (same to state.quote)
             // we know the exact input length, so we don't have the end of data symbol
-            `for(${options.allowFreeVars ? `ο=[τ=ρ=λ=${quotes.length > 0 ? 'χ=' : ''}0]` : ''};` +
+            `for(${options.allowFreeVars ? `ο=[${options.sse ? 'w=' : ''}τ=ρ=λ=${quotes.length > 0 ? 'χ=' : ''}0]` : options.sse ? 'w=0' : ''};` +
 
                 // 2. read until the known length
                 `λ<${inputLength};` +
@@ -1130,14 +1402,14 @@ export class Packer {
                     `ν-χ&&χ:` +
                     // otherwise we set χ to ν if ν is one of opening quotes
                     // (we only process quotes that actually have appeared in the input)
-                    (quotes.length > 1 ?
-                        `(${quotes.map(q => `ν==${q}`).join('|')})&&ν` :
-                        `ν==${quotes[0]}&&ν`)
+                    quoteStart
             :
-                // same as above but don't need to keep ν
-                `ο[λ++]=ν-${1 << inBits}`
+                // SSE keeps the decoded byte in ν for the word hash.
+                `ο[λ++]=ν-${options.sse ? '=' : ''}${1 << inBits}`
             ) +
 
+            // The 'w' selector reads ο[λ-'w'] (ο.NaN), reusing the hash loop.
+            (options.sse ? ',w=ο.NaN=ν>64&&ν<123?w*997+ν|0:0' : '') +
             `)` +
 
             // 3. bitwise read loop
@@ -1149,15 +1421,20 @@ export class Packer {
                 // 6. calculate the mixed prediction Σ
                 //
                 // δ: context hash
-                // μ: model index 
+                // τ: model index
                 // α: scratch variable
                 // ε: stretched probabilities later used by prediction adjustment
-                `ε=φ.map((δ,μ)=>(` +
+                `ε=φ.map((δ,τ)=>(` +
                     `α=π[δ]*2+1,` +
-                    // stretch(prob), needed for updates
                     `α=Math.log(α/(θ-α)),` +
-                    `Σ-=ω[μ]*α,` +
-                    // premultiply with learning rate
+
+                    `Σ-=(` +
+                        `ω[τ]+${options.sse ? String(SSE_WEIGHT_BIAS).replace(/^0\./, '.') + '+' : ''}` +
+                        `ω[${byteWeightIndex}]+` +
+                        `ω[${pairWeightIndex}]+` +
+                        `ω[${prefixWeightIndex}]` +
+                    `)*α,` +
+
                     `α/${recipLearningRate}` +
                 `)),` +
 
@@ -1165,6 +1442,7 @@ export class Packer {
                 // depends both on step 5 (renormalization) and on step 6 (mixed prediction).
                 //
                 // Σ: squash(sum of weighted preds) followed by adjustment
+                ssePredict +
                 `Σ=~-θ/(1+Math.exp(Σ))|1,` +
                 // β: decoded bit
                 `β=τ%θ<Σ,` +
@@ -1173,9 +1451,9 @@ export class Packer {
                 // 8. update contexts and weights with β and ν (which is now the bit context)
                 //
                 // δ: context hash
-                // μ: model index (unique in the entire code)
+                // τ: local model index, shadowing the rANS state
                 // also makes use of φ and ε below.
-                `φ.map((δ,μ)=>(` +
+                `φ.map((δ,τ)=>(` +
                     // update the bitwise context.
                     // α is not used but used here to exploit a repeated code fragment
                     `α=π[δ]+=` +
@@ -1185,8 +1463,13 @@ export class Packer {
                         // we've already verified delta is within +/-2^31, so `>>>` is not required
                         `>>${29 - precision},` +
                     // update the weight
-                    `ω[μ]+=ε[μ]*(β-Σ/θ)` +
+                    `α=ε[τ]*(β-Σ/θ),` +
+                    `ω[τ]+=α,` +
+                    `ω[${byteWeightIndex}]+=α,` +
+                    `ω[${pairWeightIndex}]+=α*${pairLearningFactor},` +
+                    `ω[${prefixWeightIndex}]+=α` +
                 `)),` +
+                sseUpdate +
                 `ν=ν*2+β` +
 
             `)` +
@@ -1199,20 +1482,22 @@ export class Packer {
                 (singleDigitSelectors ?
                     `φ='${selectors.map(i => i.join('')).join('0')}'.split(Σ=0)`
                 :
-                    `Σ=0,φ=${JSON.stringify(selectors)}`
-                ) + `.map((δ,μ)=>` +
+                    `Σ=0,φ=${JSON.stringify(selectors).replace(/"w"/g, "'w'")}`
+                ) + `.map((δ,τ)=>` +
                     // δ: an array of context offsets (1: last byte, 2: second-to-last byte, ...)
-                    // μ: model index 
+                    // τ: model index
                     // α: context hash accumulator
                     `(` +
                         `α=0,` +
-                        `${singleDigitSelectors ? `[...δ]` : `δ`}.map((δ,μ)=>` +
+                        `${singleDigitSelectors ? `[...δ]` : `δ`}.map((δ,τ)=>` +
                             // δ: context offset
                             // redundant argument and parentheses exploit a common code fragment
-                            `(α=α*997+(ο[λ-δ]|0)|0)` +
+                            // Descending offsets put missing history first; the
+                            // outer |0 resets NaN before valid bytes are hashed.
+                            `(α=α*997+ο[λ-δ]|0)` +
                         `),` +
                         `${pow2(contextBits)}-1&α*997+ν${quotes.length > 0 ? '+!!χ*129' : ''}` +
-                    `)*${numModels}+μ` +
+                    `)*${numModels}+τ` +
                 `)` +
             `;` +
 
@@ -1248,8 +1533,7 @@ export class Packer {
                 const abbrCharClass = (abbrCharClass2.length < abbrCharClass1.length ? abbrCharClass2 : abbrCharClass1);
                 secondLine +=
                     `for(κ=${stringifiedInput()};π=/[${abbrCharClass}]/.exec(κ);)` +
-                        `with(κ.split(π))` +
-                            `κ=join(shift());`;
+                        `κ=κ.split(π),κ=κ.join(κ.shift());`;
             }
         }
 
@@ -1271,14 +1555,12 @@ export class Packer {
             // remaining variables can be in any order
             [...'Σαβδεθκλμνοπρτφχω']
                 .filter(v => secondLineInit.every(([w]) => v !== w)).join('');
+        // SSE names are tuned for the compressed decoder.
         const actualNames =
-            // should use letters from existing names that we can't remove,
-            // so that we can keep the Huffman tree small
-            'M' + // from `Math`
-            'charCodeAt' +
-            'Uiny' + // from `Uint##Array`, the best possible without any further duplicate
-            'xp' + // from `exp`
-            (quotes.length > 0 ? 'f' : ''); // from `for`
+            (options.sse ? 'g' : 'M') +
+            (options.sse ? 'charCodeMt' : 'charCodeAt') +
+            'Uiny' + 'xp' + (quotes.length > 0 ? 'f' : '') +
+            (options.sse ? 'lw' : '');
 
         if (options.allowFreeVars) {
             firstLine += ';';
@@ -1306,10 +1588,14 @@ export class Packer {
         firstLine = firstLine.replace(/[^\0-\x7f]/g, v => idMap.get(v));
         secondLine = secondLine.replace(/[^\0-\x7f]/g, v => idMap.get(v));
 
-        const boundVars = ['δ', 'μ']; // always local to .map()
-        const freeVars = options.allowFreeVars ?
-            Object.keys(idMap).filter(v => !boundVars.includes(v)).map(v => idMap[v]).sort() :
-            [];
+        const boundVars = options.sse ? ['μ'] : ['δ', 'μ'];
+        const freeVars = options.allowFreeVars ? [...new Set([
+            ...[...idMap]
+                .filter(([v, name]) => name && !boundVars.includes(v) &&
+                    (v !== 'χ' || quotes.length > 0))
+                .map(([, name]) => name),
+            ...(options.sse ? ['l', 'w'] : []),
+        ])].sort() : [];
 
         return {
             firstLine,
@@ -1342,15 +1628,77 @@ export class Packer {
         }
         level = level || 1;
 
+        const localSearch = level >= 2;
+
         const performance = await getPerformanceObject();
         const copy = v => JSON.parse(JSON.stringify(v));
 
+        const compareSizes = (a, b) => {
+            if (
+                a &&
+                typeof a.compare === 'function'
+            ) {
+                return a.compare(b);
+            }
+
+            if (
+                b &&
+                typeof b.compare === 'function'
+            ) {
+                return -b.compare(a);
+            }
+
+            return Number(a) - Number(b);
+        };
+
         const cache = new Map(); // `${dynamicModels},${numAbbreviations}` -> { preparedText, preparedJs }
-        const mainInputAction = (this.inputsByType['text'] || this.inputsByType['js'])[0].action;
+        // Scores from different callbacks are not interchangeable across runs.
+        if (this.optimizeScoreFunction !== this.options.optimizeScore) {
+            this.optimizeScoreCache = new Map();
+            this.optimizeScoreFunction = this.options.optimizeScore;
+        }
+        const scoreCache =
+            this.optimizeScoreCache ??=
+            new Map();
+
+        const mainInputAction =
+            (this.inputsByType['text'] ||
+            this.inputsByType['js'])[0].action;
 
         let maxAbbreviations = -1;
         const calculateSize = current => {
-            const options = { ...this.options, ...current };
+            const options = {
+                ...this.options,
+                ...current,
+            };
+
+            const scoreKey = JSON.stringify([
+                options.dynamicModels,
+                options.numAbbreviations,
+                options.sparseSelectors,
+                options.precision,
+                options.modelMaxCount,
+                options.modelRecipBaseCount,
+                options.recipLearningRate,
+                options.pairRecipLearningRate,
+                options.contextBits,
+                options.maxMemoryMB,
+                options.sse,
+                options.optimizePrefix,
+                options.optimizeSuffix,
+                options.allowFreeVars,
+                options.disableWasm,
+            ]);
+
+            if (scoreCache.has(scoreKey)) {
+                const cached = scoreCache.get(scoreKey);
+
+                if (maxAbbreviations < 0) {
+                    maxAbbreviations = cached.maxAbbreviations;
+                }
+
+                return cached.score;
+            }
 
             const key = `${options.dynamicModels},${options.numAbbreviations}`;
             if (!cache.has(key)) {
@@ -1360,9 +1708,32 @@ export class Packer {
             }
 
             const { preparedText, preparedJs } = cache.get(key);
-            const result = Packer.doPack(preparedText, preparedJs, mainInputAction, options);
-            if (maxAbbreviations < 0) maxAbbreviations = result.maxAbbreviations;
-            return new Packed(result).estimateLength();
+            const result = Packer.doPack(
+                preparedText,
+                preparedJs,
+                mainInputAction,
+                options
+            );
+
+            if (maxAbbreviations < 0) {
+                maxAbbreviations =
+                    result.maxAbbreviations;
+            }
+
+            const packed = new Packed(result);
+
+            const optimizeInput = options.optimizePrefix + packed.firstLine +
+                packed.secondLine + options.optimizeSuffix;
+            const score = options.optimizeScore
+                ? options.optimizeScore(optimizeInput, packed, options)
+                : packed.estimateLength();
+
+            scoreCache.set(scoreKey, {
+                score,
+                maxAbbreviations: result.maxAbbreviations,
+            });
+
+            return score;
         };
 
         const reportProgress = async (pass, passRatio, current, currentSize, currentRejected, bestUpdated) => {
@@ -1370,8 +1741,12 @@ export class Packer {
 
             const info = {
                 pass, passRatio,
-                current, currentSize, currentRejected,
-                best, bestSize, bestUpdated,
+                current, currentSize: Number(currentSize),
+                // Logging only reads stronger results already cached by comparison.
+                currentSize100: currentSize?.cachedSizeAt?.(100),
+                currentSize1000: currentSize?.cachedSizeAt?.(1000),
+                currentRejected,
+                best, bestSize: Number(bestSize), bestUpdated,
             };
             if (await progress(info) === false) throw new Error('search aborted');
         };
@@ -1385,7 +1760,7 @@ export class Packer {
         const updateBest = current => {
             const size = calculateSize(current);
             let bestUpdated = false;
-            if (size < bestSize) {
+            if (compareSizes(size, bestSize) < 0) {
                 best = copy(current);
                 bestSize = size;
                 bestUpdated = true;
@@ -1405,7 +1780,7 @@ export class Packer {
         // the way to pick three points depends on the distribution and affects the search performance.
         const EXP = 1;
         const LINEAR = 0;
-        const search = async (lo, hi, dist, manualValues, score) => {
+        const search = async (lo, hi, dist, manualValues, score, anchor) => {
             if (level <= 1) {
                 for (let i = 0; i < manualValues.length; ++i) {
                     await score(manualValues[i], i / manualValues.length);
@@ -1441,19 +1816,32 @@ export class Packer {
 
             let q2 = mid(lo, hi);
             while (hi - lo >= 4) {
-                const xx = [lo, mid(lo, q2), q2, mid(q2, hi), hi];
+                const xx = [
+                    ...new Set([
+                        lo,
+                        mid(lo, q2),
+                        q2,
+                        mid(q2, hi),
+                        hi,
+                        anchor,
+                    ].filter(x => x >= lo && x <= hi))
+                ].sort((a, b) => a - b);
                 const yy = [];
-                for (const x of xx) yy.push(await evaluate(x));
+                for (const x of xx) {
+                    yy.push(await evaluate(x));
+                }
 
                 let min = 0;
-                for (let i = 1; i < 5; ++i) {
-                    if (yy[min] > yy[i]) min = i;
+                for (let i = 1; i < xx.length; ++i) {
+                    if (compareSizes(yy[min], yy[i]) > 0) {
+                        min = i;
+                    }
                 }
                 if (min === 0) {
                     hi = xx[1];
                     q2 = mid(lo, hi);
-                } else if (min === 4) {
-                    lo = xx[3];
+                } else if (min === xx.length - 1) {
+                    lo = xx[min - 1];
                     q2 = mid(lo, hi);
                 } else {
                     lo = xx[min - 1];
@@ -1466,14 +1854,36 @@ export class Packer {
         };
 
         // optimize modelRecipBaseCount
-        await search(1, 1000, EXP, [10, 20, 50, 100], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, modelRecipBaseCount: i }, 'modelRecipBaseCount', ratio);
-        });
+        const expRange = (value, lo, hi) =>
+            localSearch
+                ? [
+                    Math.max(lo, Math.floor(value * .67)),
+                    Math.min(hi, Math.ceil(value * 1.5)),
+                ]
+                : [lo, hi];
+
+        const linearRange = (value, lo, hi, radius) =>
+            localSearch
+                ? [
+                    Math.max(lo, value - radius),
+                    Math.min(hi, value + radius),
+                ]
+                : [lo, hi];
+
+        {
+            const [lo, hi] = expRange(this.options.modelRecipBaseCount, 1, 1000);
+            await search(lo, hi, EXP, [10, 20, 50, 100], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, modelRecipBaseCount: i }, 'modelRecipBaseCount', ratio);
+            });
+        }
 
         // optimize modelMaxCount
-        await search(1, 32767, EXP, [4, 5, 6], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, modelMaxCount: i }, 'modelMaxCount', ratio);
-        });
+        {
+            const [lo, hi] = expRange(this.options.modelMaxCount, 1, 32767);
+            await search(lo, hi, EXP, [4, 5, 6], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, modelMaxCount: i }, 'modelMaxCount', ratio);
+            });
+        }
         if (best.modelMaxCount === this.options.modelMaxCount) delete best.modelMaxCount;
 
         // optimize dynamicModels
@@ -1483,9 +1893,12 @@ export class Packer {
         if (best.dynamicModels === this.options.dynamicModels) delete best.dynamicModels;
 
         // optimize numAbbreviations
-        await search(0, maxAbbreviations, LINEAR, [0, 16, 32, 64], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, numAbbreviations: i }, 'numAbbreviations', ratio);
-        });
+        {
+            const [lo, hi] = linearRange(this.options.numAbbreviations, 0, maxAbbreviations, 8);
+            await search(lo, hi, LINEAR, [0, 16, 32, 64], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, numAbbreviations: i }, 'numAbbreviations', ratio);
+            });
+        }
         if (best.numAbbreviations === this.options.numAbbreviations) delete best.numAbbreviations;
 
         // optimize sparseSelectors by simulated annealing
@@ -1497,16 +1910,22 @@ export class Packer {
         while (temperature > targetTemperature) {
             const next = current.slice();
 
+            const index = Math.random() * next.length | 0;
             let added;
             do {
-                added = Math.random() * AUTO_SELECTOR_LIMIT | 0;
+                added = Math.random() < .8
+                    ? next[index] ^ (1 << (Math.random() * 9 | 0))
+                    : Math.random() * AUTO_SELECTOR_LIMIT | 0;
             } while (next.includes(added));
-            next[Math.random() * next.length | 0] = added;
+            next[index] = added;
             next.sort((a, b) => a - b);
 
             const { size: nextSize, bestUpdated } = updateBest({ ...best, sparseSelectors: next });
-            // if nextSize > currentSize then accept by some probability exp(delta / kT) < 1
-            const rejected = Math.exp((currentSize - nextSize) / (6 * temperature)) < Math.random();
+            // Use the same adaptive comparison as global-best selection,
+            // reusing cached compression results for close candidates.
+            const delta = compareSizes(nextSize, currentSize);
+            // Better/equal moves are always accepted; worse moves are probabilistic.
+            const rejected = delta > 0 && Math.exp(-delta / (6 * temperature)) < Math.random();
             await reportProgress(
                 'sparseSelectors', Math.log(temperature) / Math.log(targetTemperature),
                 { ...best, sparseSelectors: next }, nextSize,
@@ -1516,24 +1935,76 @@ export class Packer {
                 currentSize = nextSize;
             }
 
-            temperature *= 0.99;
+            temperature *= 0.97;
         }
 
         // optimize precision
-        await search(1, 21, LINEAR, [12, 14, 16], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, precision: i }, 'precision', ratio);
-        });
+        {
+            const [lo, hi] = linearRange(this.options.precision, 1, 21, 3);
+            await search(lo, hi, LINEAR, [12, 14, 16], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, precision: i }, 'precision', ratio);
+            });
+        }
         if (best.precision === this.options.precision) delete best.precision;
 
+        // Search the learning-rate scale jointly at cheap decoder multipliers.
+        // Independent steps usually lose the short literal for their ratio, even
+        // when moving both rates together would improve the packed size.
+        {
+            const learningRate = best.recipLearningRate ?? this.options.recipLearningRate;
+            const pairRate = best.pairRecipLearningRate ?? this.options.pairRecipLearningRate;
+            const currentFactor = learningRate / pairRate;
+            const factors = new Set([1, 2, 3, 4, 5, 6]);
+            if (Number.isInteger(currentFactor) && currentFactor <= 99999) {
+                factors.add(currentFactor);
+            }
+            for (const factor of factors) {
+                const limit = Math.floor(99999 / factor);
+                const clamp = value => Math.max(1, Math.min(limit, Math.round(value)));
+                // Freeze the reference scale across families rather than letting
+                // earlier improvements move the search window for later ones.
+                const center = clamp(learningRate / factor);
+                const [lo, hi] = expRange(center, 1, limit);
+                const manualValues = [...new Set([.75, 1, 1.25].map(scale => clamp(center * scale)))];
+                const score = async (i, ratio) => await updateBestAndReportProgress({
+                    ...best,
+                    recipLearningRate: i * factor,
+                    pairRecipLearningRate: i,
+                }, `learningRates×${factor}`, ratio);
+                // Also covers an anchor at a boundary or in a singleton range.
+                await score(center, 0);
+                await search(lo, hi, EXP, manualValues, score, center);
+            }
+        }
+
+        // Independently refine the winning rates, allowing non-integer ratios.
         // optimize recipLearningRate
-        await search(1, 99999, EXP, [500, 750, 1000, 1250, 1500], async (i, ratio) => {
-            return await updateBestAndReportProgress({ ...best, recipLearningRate: i }, 'recipLearningRate', ratio);
-        });
+        {
+            const center = best.recipLearningRate ?? this.options.recipLearningRate;
+            const [lo, hi] = expRange(center, 1, 99999);
+            await search(lo, hi, EXP, [500, 750, 1000, 1250, 1500], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, recipLearningRate: i }, 'recipLearningRate', ratio);
+            }, center);
+        }
         if (best.recipLearningRate === this.options.recipLearningRate) delete best.recipLearningRate;
+
+        // optimize pairRecipLearningRate
+        {
+            const center = best.pairRecipLearningRate ?? this.options.pairRecipLearningRate;
+            const [lo, hi] = expRange(center, 1, 99999);
+            await search(lo, hi, EXP, [250, 400, 500, 750, 1000], async (i, ratio) => {
+                return await updateBestAndReportProgress({ ...best, pairRecipLearningRate: i }, 'pairRecipLearningRate', ratio);
+            }, center);
+        }
+        if (best.pairRecipLearningRate === this.options.pairRecipLearningRate) delete best.pairRecipLearningRate;
 
         // apply the final result to this
         this.options = { ...this.options, ...best };
-        return { elapsedMsecs: performance.now() - searchStart, best, bestSize };
+        return {
+            elapsedMsecs: performance.now() - searchStart,
+            best,
+            bestSize: Number(bestSize),
+        };
     }
 }
 
@@ -1560,4 +2031,3 @@ class Packed {
             estimateDeflatedSize(this.secondLine));
     }
 }
-

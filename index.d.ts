@@ -14,6 +14,7 @@ export type ScaledFreq = number;
 export type Bit = 0 | 1;
 
 export interface AnsOptions {
+    sse?: boolean;
     outBits: number;
     precision: number;
 }
@@ -72,6 +73,12 @@ export class SparseContextModel implements DirectContextModel {
     release(): void;
 }
 
+export class WordContextModel extends DirectContextModel {
+    constructor(options: DirectContextModelOptions);
+    word: number;
+    sparseContext: number;
+}
+
 export interface LogisticMixModelOptions {
     recipLearningRate: number;
     precision: number;
@@ -86,6 +93,9 @@ export class LogisticMixModel implements Model {
 }
 
 export interface DefaultModelOptions extends DirectContextModelOptions, LogisticMixModelOptions {
+    /** Opt-in compact secondary symbol estimation. Default: false. */
+    sse?: boolean;
+    pairRecipLearningRate?: number;
     sparseSelectors: number[];
     modelQuotes: boolean;
 }
@@ -135,6 +145,10 @@ export interface OptimizerProgressInfo<Params = number[]> {
     passRatio?: number;
     current: Params;
     currentSize: number;
+    /** Cached Zopfli-100 size, if already calculated; logging does not compute it. */
+    currentSize100?: number;
+    /** Cached Zopfli-1000 size, if already calculated; logging does not compute it. */
+    currentSize1000?: number;
     currentRejected: boolean;
     best: Params;
     bestSize: number[];
@@ -178,7 +192,21 @@ export const enum DynamicModelFlags {
 }
 
 export interface PackerOptions {
+    /** Opt-in compact SSE. May improve the final ZIP; not a universal win. */
+    sse?: boolean;
+    pairRecipLearningRate?: number;
     sparseSelectors?: number[];
+    /**
+     * Memory budget for model context tables, in decimal MB
+     * (1 MB = 1,000,000 bytes).
+     *
+     * Higher values may improve compression at the cost of greater
+     * decompression memory usage. Context table sizes increase in
+     * power-of-two steps, so the actual allocation may be below this value.
+     * Auxiliary mixer weights are additional.
+     *
+     * Default: 500.
+     */
     maxMemoryMB?: number;
     contextBits?: number;
     precision?: number;
@@ -191,9 +219,20 @@ export interface PackerOptions {
     numAbbreviations?: number;
     dynamicModels?: number; // bit flags out of DynamicModelFlags
     allowFreeVars?: boolean;
+    /** Fitness context only; not included in makeDecoder() output or the legacy estimate. */
+    optimizePrefix?: string;
+    optimizeSuffix?: string;
+    /** Receives prefix + firstLine + secondLine + suffix. */
+    optimizeScore?: (input: string, packed: Packed, options: PackerOptions) => number | {
+        valueOf(): number;
+        /** Signed size difference; also used for annealing acceptance probability. */
+        compare(other: any): number;
+        cachedSizeAt?(iterations: number): number | undefined;
+    };
 }
 
 export interface OptimizedPackerOptions {
+    pairRecipLearningRate?: number;
     sparseSelectors: number[];
     precision?: number;
     modelMaxCount?: number;
@@ -226,4 +265,3 @@ export interface Packed {
     readonly freeVars: string[];
     estimateLength(): number;
 }
-

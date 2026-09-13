@@ -104,7 +104,7 @@ input[type=number] { width: 5em; }
 <aside id=$outputmessage></aside>
 <footer><ul>
 <li><label>Number of contexts: <input id=$numcontexts type=number value=12 min=1 max=64></label> <a href=#num-contexts title=Help>ℹ️</a>
-<li><label>Maximum memory usage: <input id=$maxmemory type=number value=150 min=10 max=1024> MB (<span id=$usedmemory>-</span> MB in use)</label> <a href=#max-memory title=Help>ℹ️</a>
+<li><label>Maximum memory usage: <input id=$maxmemory type=number value=500 min=100 max=4000> MB (<span id=$usedmemory>-</span> MB in use)</label> <a href=#max-memory title=Help>ℹ️</a>
 <li><label><input type=checkbox id=$dirty> Allow the decoder to pollute the global scope</label> <a href=#dirty title=Help>ℹ️</a>
 <li><button id=$reset>Reset parameters</button> <button id=$optimize>Optimize parameters</button> <a href=#optimize title=Help>ℹ️</a>
 </ul><details><summary>Advanced configuration</summary><ul>
@@ -166,7 +166,7 @@ input[type=number] { width: 5em; }
 
 <h3>Output Configuration</h3>
 <p id=num-contexts><strong>Number of contexts</strong> relates to the complexity of modelling. The larger number of contexts will compress better, but at the expense of linear increase in both the time and memory usage. The default is 12, which targets at most 1 second of latency permitted for typical 30 KB input.
-<p id=max-memory><strong>Maximum memory usage</strong> configures the maximum memory to be used both for compression and decompression. Increasing or decreasing memory usage only affects the compression ratio and not the run time. The actual memory usage can be as low as a half of the specified due to the internal architecture. The default is 150 MB.
+<p id=max-memory><strong>Maximum memory usage</strong> configures the maximum memory to be used both for compression and decompression. Increasing or decreasing memory usage only affects the compression ratio and not the run time. The actual memory usage can be as low as a half of the specified due to the internal architecture. The default is 500 MB. Values use decimal MB (1 MB = 1,000,000 bytes).
 <p id=dirty><strong>Allowing the decoder to pollute the global scope</strong> is unsafe especially when the Roadroller output should coexist with other code or there are elements with single letter <code>id</code> attributes and turned off by default. But if you can control your environment (typical for demos), you can turn this on for a smaller decoder.
 <p id=optimize><strong>Optimize parameters</strong> button searches for better modelling parameters. At the first click it runs a quick search that takes 10 seconds for typical 30 KB input, and subsequent click will run a full search. Parameters are solely related to the compression ratio so you can try this as many as you can afford.
 
@@ -379,8 +379,8 @@ const compress = async optimize => {
 
     try {
         const maxMemoryMB = Number($maxmemory.value);
-        if (!(10 <= maxMemoryMB && maxMemoryMB <= 1024)) {
-            throw 'maximum memory usage should be between 10 MB and 1 GB';
+        if (!(100 <= maxMemoryMB && maxMemoryMB <= 4000)) {
+            throw 'maximum memory usage should be between 100 MB and 4000 MB';
         }
 
         const inputs = [];

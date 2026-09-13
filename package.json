@@ -44,5 +44,11 @@
   },
   "dependencies": {
     "esm": "^3.2.25"
+  },
+  "optionalDependencies": {
+    "node-zopfli-es": "^2.0.6"
+  },
+  "allowScripts": {
+    "node-zopfli-es@2.0.6": true
   }
 }

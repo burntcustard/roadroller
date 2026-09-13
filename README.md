@@ -105,15 +105,32 @@ Each input can be further configured by input type and action. In the CLI you pu
 
 **Number of contexts** (CLI `-S|--selectors xCOUNT`) relates to the complexity of modelling. The larger number of contexts will compress better, but at the expense of linear increase in both the time and memory usage. The default is 12, which targets at most 1 second of latency permitted for typical 30 KB input.
 
-**Maximum memory usage** (CLI `-M|--max-memory MEGABYTES`, API `maxMemoryMB` in the options object) configures the maximum memory to be used for decompression. Increasing or decreasing memory usage mostly affects the compression ratio and not the run time. The default is 150 MB and a larger value is not recommended for various reasons:
+**Maximum memory usage** (CLI `-M|--max-memory MEGABYTES`, API `maxMemoryMB` in the options object) controls the memory budget for model context tables, including the extra word model when SSE is enabled. Auxiliary mixer weights are additional. Higher values may improve compression at the cost of substantially higher decompression memory usage and allocation time.
 
-* Any further gain for larger memory use is negligible for typical inputs less than 100 KB.
+Memory values use decimal megabytes: 1 MB = 1,000,000 bytes. The requested memory value is a budget rather than an exact allocation. Context tables use power-of-two capacities, so multiple memory budgets may select the same table size. Use `-v` to print the actual context-table memory usage to stderr.
 
-* The compression may use more memory than the decompression: an one-shot compression may use up to 50% more memory, the optimizer will use 50% more on top of that.
+Useful starting points:
 
-* It does take time to allocate and initialize a larger memory (~500 ms for 1 GB), so it is not a good choice for small inputs.
+- **150 MB:** conservative.
+- **500 MB:** default; more compression-focused where memory use is less constrained.
+- **1000 MB:** size-focused; a good balance for memory-tolerant sizecoding.
+- **2000 MB:** aggressive size-first setting.
 
-The actual memory usage can be as low as a half of the specified due to the internal architecture; `-v` will print the actual memory usage to stderr.
+```sh
+# Conservative
+roadroller -M150 input.js -o packed.js
+
+# Default (more compression-focused)
+roadroller -M500 input.js -o packed.js
+
+# Size-focused
+roadroller -M1000 input.js -o packed.js
+
+# Aggressive
+roadroller -M2000 input.js -o packed.js
+```
+
+The CLI accepts budgets from 100 to 4000 MB. Larger tables do not guarantee smaller output, so compare the final compressed archive when choosing a value.
 
 **Allowing the decoder to pollute the global scope** (CLI `-D|--dirty`, API `allowFreeVars` in the options object) is unsafe especially when the Roadroller output should coexist with other code or there are elements with single letter `id` attributes and turned off by default. But if you can control your environment (typical for demos), you can turn this on for a smaller decoder.
 
@@ -140,6 +157,26 @@ The actual memory usage can be as low as a half of the specified due to the inte
 **Precision** (CLI `-Zpr|--precision BITS`, API `precision` in the options object) is the number of fractional bits used in the internal fixed point representation. This is shared between the entropy coder and context models and can't be decoupled. The default of 16 should be enough, you can also try to decrease it.
 
 **Learning rate** (CLI `-Zlr|--learning-rate RATE`, API `recipLearningRate` in the options object) adjusts how fast would the context mixer adapt, where smaller is faster. The default is 500 which should be fine for long enough inputs. If your demo is smaller than 10 KB you can also try smaller numbers.
+
+The optimizer also searches the ordinary and pair learning rates together, keeping `recipLearningRate / pairRecipLearningRate` at integer factors 1 through 6 (plus the current integer factor, if within the search bounds). These ratios produce short multipliers in the generated decoder. Level 1 samples a few scales for each factor; higher levels refine each scale locally. Independent rate searches then allow non-integer ratios to win when they produce a better score. The existing rate options retain their meanings.
+
+**Secondary symbol estimation** (CLI `--sse`, API `sse: true`, default `false`) adds a compact correction to the mixed prediction in logit space. It uses eight wrapping buckets with no interpolation, trained by the current byte prefix and previous byte. SSE also adds a rolling word-context model (bytes 65–122), a `.1` mixer bias, and a tuned terminal-state offset for 6-bit rANS output. Count tables automatically use the narrowest safe array. SSE shares a padded mixer weights array and increases decoder size and auxiliary memory; measure the final archive to decide whether it helps. The context-table memory estimate does not include these auxiliary mixer weights. SSE uses the JavaScript encoder rather than the existing WASM runner and stays fixed during parameter search. Reported CLI parameters retain `--sse` so they reproduce the selected mode.
+
+**Optimization wrappers** (CLI `--optimize-wrapper FILE`, API `optimizePrefix` and `optimizeSuffix`) supply the surrounding content when scoring a candidate. The wrapper file must contain exactly one `__ROADROLLER__` marker, for example `<script>__ROADROLLER__</script>`. The CLI currently requires `--zopfli` for this option:
+
+```sh
+roadroller --zopfli --optimize-wrapper page-wrapper.html -O1 input.js -o packed.js
+```
+
+The optional `node-zopfli-es` dependency is loaded by the CLI only when `--zopfli` is requested.
+
+The wrapper affects scoring only: `packed.js` and `makeDecoder()` still contain only Roadroller output. The legacy size estimator remains unchanged and does not score wrapper content.
+
+Custom API scorers now receive `optimizeScore(input, packed, options)`, where `input` is exactly `optimizePrefix + packed.firstLine + packed.secondLine + optimizeSuffix`. This replaces the previous `(packed, options)` callback signature. A scorer may return a number or an object with `valueOf()` and `compare(other)` methods. `createZopfliPackedScore()` from `zopfli.mjs` accepts this complete input, comparing candidates first at 1 iteration. Differences greater than 8 bytes use that quick result; candidates within 8 bytes are compared at 100 iterations. Candidates within 4 bytes at 100 iterations are compared at 1000 iterations, with remaining ties broken by UTF-8 input length. Numeric score conversions still use the 1-iteration result.
+
+Sparse-selector annealing uses the same adaptive comparison as global-best selection, reusing cached compression results. Better or equal moves are always accepted; worse moves are accepted with probability `exp(-delta / (6 * temperature))`, where `delta` is the comparison's size difference. Custom score objects should therefore return a size difference from `compare(other)`, rather than only a sign. The cooling rate and selector mutation distribution are unchanged.
+
+Optimization logs show `12775` for a candidate with only a 1-iteration result, `12758/12751` for cached 1/100-iteration results, or `12755/12752/12750` for cached 1/100/1000-iteration results. Logging never triggers the stronger compression passes. API progress exposes these optional cached results as `currentSize100` and `currentSize1000`, while `currentSize` remains the numeric quick score.
 
 **Model max count** (CLI `-Zmc|--model-max-count COUNT`, API `modelMaxCount` in the options object) adjusts how fast would individual contexts adapt, where smaller is faster. The model adapts fastest when a particular context is first seen, but that process becomes slower as the context is seen multiple times. This parameter limits how slowest the adaptation process can be. The default of 5 is specifically tuned for JS code inputs.
 
@@ -202,4 +239,3 @@ The Roadroller compressor proper is licensed under the MIT license. In addition 
 [DEFLATE]: https://en.wikipedia.org/wiki/Deflate
 [Logistic context mixing]: https://en.wikipedia.org/wiki/Context_mixing#Logistic_Mixing
 [rANS]: https://en.wikipedia.org/wiki/Asymmetric_numeral_systems#Range_variants_(rANS)_and_streaming
-

@@ -1,5 +1,10 @@
 import test from 'ava';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { spawnSync } from 'child_process';
+import { createZopfliPackedScore, zopfliDeflatedSize } from './zopfli.mjs';
 import {
     ResourcePool, AnsEncoder, AnsDecoder, DirectContextModel, DefaultModel, Packer,
     compressWithModel, compressWithDefaultModel, decompressWithModel
@@ -402,15 +407,44 @@ function packAndReturn(data, options = {}) {
 }
 
 test('Packer', t => {
-    t.is(packAndEval('3 + 4 * 5'), 23);
-    t.is(packAndReturn('3 + 4 * 5'), '3+4*5');
+    for (const sse of [false, true]) {
+        t.is(packAndEval('3 + 4 * 5', { sse }), 23);
+        t.is(packAndReturn('3 + 4 * 5', { sse }), '3+4*5');
 
-    // allowFreeVars
-    const cleanlyPacked = pack('3 + 4 * 5', { allowFreeVars: true });
-    t.deepEqual(cleanlyPacked.freeVars, []);
-    t.is(packAndEval('3 + 4 * 5', { allowFreeVars: true }), 23);
-    t.is(packAndReturn('3 + 4 * 5', { allowFreeVars: true }), '3+4*5');
+        // Dirty decoders report the variables the caller needs to declare.
+        const packed = pack('3 + 4 * 5', { sse, allowFreeVars: true });
+        t.true(packed.freeVars.length > 0);
+        if (sse) t.true(packed.freeVars.includes('l'));
+        t.is(packAndEval('3 + 4 * 5', { sse, allowFreeVars: true }), 23);
+        t.is(packAndReturn('3 + 4 * 5', { sse, allowFreeVars: true }), '3+4*5');
+    }
+    t.throws(() => pack('1', { sse: 1 }), { message: 'Packer: sse must be a boolean' });
 });
+
+for (const [level, targetRate, targetPairRate] of [[1, 1876, 469], [2, 1600, 400]]) {
+    test(`optimizer escapes independent learning-rate minimum (level ${level})`, async t => {
+        const packer = new Packer([{ type: 'text', action: 'return', data: 'coupled learning rates' }], {
+            maxMemoryMB: 1,
+            sparseSelectors: [0],
+            recipLearningRate: 1500,
+            pairRecipLearningRate: 500,
+            optimizeScore: (_, packed, options) => {
+                const lr = options.recipLearningRate;
+                const lp = options.pairRecipLearningRate;
+                // Neither independent move can leave the initial local minimum.
+                if (lr === 1500 && lp === 500) return 100;
+                if (lr / lp !== 4) return 200;
+                return Math.abs(lp - targetPairRate);
+            },
+        });
+        const result = await packer.optimize(level);
+        t.is(result.bestSize, 0);
+        t.is(packer.options.recipLearningRate, targetRate);
+        t.is(packer.options.pairRecipLearningRate, targetPairRate);
+        const { firstLine, secondLine } = packer.makeDecoder();
+        t.is(Function(`return ${firstLine}${secondLine}`)(), 'coupled learning rates');
+    });
+}
 
 test('abbreviations', t => {
     t.is(packAndEval(`
@@ -498,3 +532,118 @@ test('parameter agility', t => {
     t.is(packAndEval('3 + 4 * 5', { modelMaxCount: 32767 }), 23);
 });
 
+// Native decoder generation and wrapper-aware scoring.
+test('native decoder quote shortcut is restricted to 7-bit input', t => {
+    for (const data of ['"hello" `world`', '"hello" `world`\x9e\xdc']) {
+        for (const allowFreeVars of [false, true]) {
+            const options = { type: 'text', dynamicModels: 1, allowFreeVars, sparseSelectors: [0, 5, 513] };
+            t.is(packAndReturn(data, options), data);
+            t.is(pack(data, options).secondLine.includes('%62==34'), !data.includes('\x9e'));
+        }
+    }
+});
+
+test('native abbreviation loop retains short branches', t => {
+    const data = 'const alpha=1,beta=2,gamma=3;[alpha,beta,gamma,alpha,beta,gamma]';
+    for (const numAbbreviations of [0, 1, 2, 3, 64]) {
+        const options = { numAbbreviations };
+        t.deepEqual(packAndEval(data, options), [1, 2, 3, 1, 2, 3]);
+        const packed = pack(data, options);
+        t.is(packed.secondLine.includes('with('), numAbbreviations > 0 && numAbbreviations < 3);
+    }
+});
+
+test('optimizer supplies exact wrapped input and invalidates incompatible scores', async t => {
+    let calls = 0;
+    const score = (input, packed, options) => {
+        ++calls;
+        t.is(input, options.optimizePrefix + packed.firstLine + packed.secondLine + options.optimizeSuffix);
+        return input.length;
+    };
+    const packer = new Packer([{ type: 'text', action: 'return', data: 'wrapper test' }], {
+        maxMemoryMB: 1, sparseSelectors: [0], optimizePrefix: '<script>',
+        optimizeSuffix: '</script>é', optimizeScore: score,
+    });
+    const initialOutput = packer.makeDecoder();
+    const initialOnly = async () => t.throwsAsync(packer.optimize(1, () => false), { message: 'search aborted' });
+    await initialOnly();
+    t.is(calls, 1);
+    await initialOnly();
+    t.is(calls, 1);
+    packer.options.optimizePrefix = '<body><script>';
+    await initialOnly();
+    t.is(calls, 2);
+    t.deepEqual(packer.makeDecoder(), initialOutput);
+    packer.options.optimizeScore = (...args) => score(...args);
+    await initialOnly();
+    t.is(calls, 3);
+    packer.options.sse = true;
+    await initialOnly();
+    t.is(calls, 4);
+});
+
+test('Zopfli scores supplied UTF-8 input with byte-length tie breaking', t => {
+    const create = createZopfliPackedScore();
+    const input = '<script>"héllo"</script>';
+    const score = create(input);
+    t.is(Number(score), zopfliDeflatedSize(input));
+    t.is(score.fallback, Buffer.byteLength(input));
+    t.is(score.compare(create(input)), 0);
+    // Force ties to verify all refinement levels without expensive compression.
+    const steps = [];
+    score.sizeAt = iterations => { steps.push(iterations); return 10; };
+    const other = create('longer input '.repeat(5));
+    other.sizeAt = () => 10;
+    t.true(score.compare(other) < 0);
+    t.deepEqual(steps, [1, 100, 1000]);
+});
+
+test('CLI validates wrappers and keeps them out of output', t => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'roadroller-wrapper-'));
+    t.teardown(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const wrapper = path.join(dir, 'wrapper.html');
+    const output = path.join(dir, 'output.js');
+    const run = args => spawnSync(process.execPath, ['cli.mjs', ...args, '-t', 'js', '-'], {
+        input: '3+4', encoding: 'utf8',
+    });
+    fs.writeFileSync(wrapper, '<script>__ROADROLLER__</script>');
+    let result = run(['--optimize-wrapper', wrapper, '-O0']);
+    t.is(result.status, 1);
+    t.true(result.stderr.includes('currently requires --zopfli'), result.stderr);
+    for (const content of ['no marker', '__ROADROLLER____ROADROLLER__']) {
+        fs.writeFileSync(wrapper, content);
+        result = run(['--zopfli', '--optimize-wrapper', wrapper, '-O0']);
+        t.is(result.status, 1);
+        t.true(result.stderr.includes('exactly one __ROADROLLER__ marker'));
+    }
+    fs.writeFileSync(wrapper, '<script>__ROADROLLER__</script>');
+    result = run(['--zopfli', '--optimize-wrapper', wrapper, '--optimize-wrapper', wrapper]);
+    t.is(result.status, 1);
+    t.true(result.stderr.includes('duplicate --optimize-wrapper'));
+    result = run(['--zopfli', '--optimize-wrapper', path.join(dir, 'missing')]);
+    t.is(result.status, 1);
+    t.true(result.stderr.includes('cannot read optimize wrapper'));
+    // --sse must leave the default optimization enabled. Verbose progress also
+    // reports the flag among the parameters needed to reproduce the decoder.
+    result = run(['--zopfli', '--optimize-wrapper', wrapper, '--sse', '-M100', '-o', output]);
+    t.is(result.status, 0, result.stderr);
+    t.true(result.stderr.includes('--sse'));
+    const code = fs.readFileSync(output, 'utf8');
+    t.false(code.includes('<script>'));
+    t.false(code.includes('</script>'));
+    t.is(Function(`return ${code}`)(), 7);
+});
+
+
+test('CLI validates decimal memory budgets up to 4000 MB', t => {
+    // Help still validates options, without allocating context tables.
+    for (const flag of ['-M', '--max-memory=']) {
+        for (const budget of [99, 100, 150, 500, 1000, 2000, 4000, 4001]) {
+            const result = spawnSync(process.execPath, ['cli.mjs', `${flag}${budget}`, '--help'], {
+                encoding: 'utf8',
+            });
+            t.is(result.status, budget >= 100 && budget <= 4000 ? 0 : 1, result.stderr);
+            if (budget < 100 || budget > 4000) t.true(result.stderr.includes('invalid --max-memory argument'));
+        }
+    }
+});
